@@ -9,6 +9,7 @@
 """Custom PyTorch ops for efficient bias and activation."""
 
 import os
+import warnings
 import numpy as np
 import torch
 import dnnlib
@@ -33,18 +34,32 @@ activation_funcs = {
 #----------------------------------------------------------------------------
 
 _plugin = None
+_init_failed = False
 _null_tensor = torch.empty([0])
 
 def _init():
-    global _plugin
+    global _plugin, _init_failed
+    if _plugin is not None:
+        return True
+    if _init_failed:
+        return False
     if _plugin is None:
-        _plugin = custom_ops.get_plugin(
-            module_name='bias_act_plugin',
-            sources=['bias_act.cpp', 'bias_act.cu'],
-            headers=['bias_act.h'],
-            source_dir=os.path.dirname(__file__),
-            extra_cuda_cflags=['--use_fast_math', '--allow-unsupported-compiler'],
-        )
+        try:
+            _plugin = custom_ops.get_plugin(
+                module_name='bias_act_plugin',
+                sources=['bias_act.cpp', 'bias_act.cu'],
+                headers=['bias_act.h'],
+                source_dir=os.path.dirname(__file__),
+                extra_cuda_cflags=['--use_fast_math', '--allow-unsupported-compiler'],
+            )
+        except Exception as err:
+            _init_failed = True
+            warnings.warn(
+                f'Failed to build CUDA op "bias_act_plugin"; falling back to reference implementation. '
+                f'Original error: {err}',
+                RuntimeWarning,
+            )
+            return False
     return True
 
 #----------------------------------------------------------------------------

@@ -12,6 +12,7 @@ import re
 import json
 import tempfile
 import torch
+from torch.utils.cpp_extension import verify_ninja_availability
 
 import dnnlib
 from training import training_loop
@@ -42,6 +43,34 @@ def subprocess_fn(rank, c, temp_dir):
 
     # Execute training loop.
     training_loop.training_loop(rank=rank, **c)
+
+#----------------------------------------------------------------------------
+
+def build_custom_ops_or_die():
+    """Build required fused CUDA ops once before spawning worker processes."""
+    # Use a writable cache directory by default so extension build artifacts
+    # are stable across runs and do not depend on the host user's home config.
+    if 'TORCH_EXTENSIONS_DIR' not in os.environ:
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        os.environ['TORCH_EXTENSIONS_DIR'] = os.path.join(repo_root, '.cache', 'torch_extensions')
+    os.makedirs(os.environ['TORCH_EXTENSIONS_DIR'], exist_ok=True)
+
+    try:
+        verify_ninja_availability()
+
+        from torch_utils.ops import bias_act
+        from torch_utils.ops import upfirdn2d
+
+        if not bias_act._init():
+            raise RuntimeError('Failed to build or load "bias_act_plugin".')
+        if not upfirdn2d._init():
+            raise RuntimeError('Failed to build or load "upfirdn2d_plugin".')
+    except Exception as err:
+        raise click.ClickException(
+            'Custom CUDA ops prebuild failed. '
+            'Please run `bash scripts/build_custom_ops.sh` to diagnose and fix the toolchain, '
+            f'then retry training.\nOriginal error: {err}'
+        ) from err
 
 #----------------------------------------------------------------------------
 
@@ -84,6 +113,11 @@ def launch_training(c, desc, outdir, dry_run):
     os.makedirs(c.run_dir)
     with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
         json.dump(c, f, indent=2)
+
+    # Build fused CUDA ops once in the parent process, then spawn workers.
+    # This avoids repeated builds and surfaces environment issues early.
+    print('Prebuilding custom CUDA ops...')
+    build_custom_ops_or_die()
 
     # Launch processes.
     print('Launching processes...')
@@ -156,8 +190,8 @@ def main(**kwargs):
     c.G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator')
     c.D_kwargs = dnnlib.EasyDict(class_name='training.networks.Discriminator')
     
-    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0], eps=1e-8)
-    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0], eps=1e-8)
+    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0, 0.0], eps=1e-8)
+    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0, 0.0], eps=1e-8)
     
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.R3GANLoss')
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
