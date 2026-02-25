@@ -1,8 +1,8 @@
-## The GAN is dead; long live the GAN! A Modern Baseline GAN (R3GAN)<br><sub>Official PyTorch implementation of the NeurIPS 2024 paper</sub>
+## The GAN is dead; long live the GAN! A Modern Baseline GAN (R3GAN)`<br><sub>`Official PyTorch implementation of the NeurIPS 2024 paper`</sub>`
 
 ![Teaser image](./doc/teaser.png)
 
-**The GAN is dead; long live the GAN! A Modern Baseline GAN**<br>
+**The GAN is dead; long live the GAN! A Modern Baseline GAN**`<br>`
 Nick Huang, [Aaron Gokaslan](https://skylion007.github.io/), [Volodymyr Kuleshov](https://www.cs.cornell.edu/~kuleshov/), [James Tompkin](https://www.jamestompkin.com)
 
 OpenReview: https://openreview.net/forum?id=OrtN9hPP7V
@@ -19,6 +19,7 @@ Abstract: There is a widely-spread claim that GANs are difficult to train, and G
 Our code requires the same packages as the official StyleGAN3 repo. However, we have updated the code so it is compatible with the latest version of the required packages (including PyTorch, etc).
 
 ## Getting started
+
 To generate images using a given model, run:
 
 ```
@@ -33,7 +34,11 @@ To reproduce the main results from our paper, run the following commands:
 
 ```
 # CIFAR10
-python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=8 --batch=512 --mirror=1 --aug=1 --cond=1 --preset=CIFAR10 --tick=1 --snap=200
+python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=2 --batch=512 --mirror=1 --aug=1 --cond=1 --preset=CIFAR10 --tick=1 --snap=200
+
+# CIFAR10 RANK
+python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=2 --batch=512 --mirror=1 --aug=1 --cond=1 --preset=CIFAR10 --tick=1 --snap=200 \
+	--rank-loss=1 --rank-loss-type=listmle --lambda-rank=0.1 --lambda-adv=1.0 --rank-k=3
 
 # FFHQ 64x64
 python train.py --outdir=./training-runs --data=./datasets/ffhq-64x64.zip --gpus=8 --batch=256 --mirror=1 --aug=1 --preset=FFHQ-64 --tick=1 --snap=200
@@ -61,9 +66,11 @@ We provide pre-trained models for our proposed training configuration (config E)
 - [https://huggingface.co/brownvc/R3GAN-ImgNet-64x64](https://huggingface.co/brownvc/R3GAN-ImgNet-64x64)
 
 ## Preparing datasets
+
 We use the same dataset format and dataset preprocessing tool as StyleGAN3 and EDM, refer to their repos for more details.
 
 ## Quality metrics
+
 We support the following metrics:
 
 * `fid50k_full`: Fr&eacute;chet inception distance against the full dataset.
