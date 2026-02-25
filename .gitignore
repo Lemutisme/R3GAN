@@ -1,1 +1,6 @@
 __pycache__
+/.venv/
+/datasets/
+/.cache/
+/training-runs/
+*.sh

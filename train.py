@@ -166,6 +166,21 @@ def parse_comma_separated_list(s):
 @click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  type=bool, default=False, show_default=True)
 @click.option('--aug',          help='Enable Augmentation', metavar='BOOL',                     type=bool, default=True, show_default=True)
 @click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
+@click.option('--disable-r1',   help='Disable R1 gradient penalty on real images',              is_flag=True)
+@click.option('--disable-r2',   help='Disable R2 gradient penalty on generated images',         is_flag=True)
+
+# Rank loss options.
+@click.option('--rank-loss',       help='Enable ranking loss for D', metavar='BOOL',                 type=bool, default=False, show_default=True)
+@click.option('--rank-k',          help='Number of interpolation steps for ranking', metavar='INT',  type=click.IntRange(min=2), default=8, show_default=True)
+@click.option('--rank-loss-type',  help='Ranking loss type', type=click.Choice(['listmle', 'pairwise_logistic', 'pairwise_hinge']), default='listmle', show_default=True)
+@click.option('--lambda-rank',     help='Weight for ranking loss', type=float, default=0.1, show_default=True)
+@click.option('--lambda-adv',      help='Weight for adversarial loss (set 0 for pure rank ablation)', type=float, default=1.0, show_default=True)
+@click.option('--rank-mode',       help='Interpolation mode for rank list', type=click.Choice(['intrpl', 'noise', 'add_mix']), default='intrpl', show_default=True)
+@click.option('--rank-alpha-dist', help='Alpha distribution for rank list', type=click.Choice(['linear', 'cosine', 'random']), default='linear', show_default=True)
+@click.option('--rank-augment',    help='Apply augmentation to rank images (default True to match R1/R2 when aug=1)', metavar='BOOL', type=bool, default=True, show_default=True)
+@click.option('--rank-margin',     help='Margin for pairwise hinge rank loss', type=float, default=1.0, show_default=True)
+@click.option('--rank-score-reg',  help='Score regularization weight for rank loss (lambda*mean(scores^2))', type=float, default=0.0, show_default=True)
+@click.option('--rank-replaces-adv', help='Use ranking loss as replacement of relativistic loss for D (R1+R2 stay)', is_flag=True)
 
 # Misc hyperparameters.
 @click.option('--g-batch-gpu',  help='Limit batch size per GPU for G', metavar='INT',           type=click.IntRange(min=1))
@@ -327,6 +342,14 @@ def main(**kwargs):
         raise click.ClickException('--batch must be a multiple of --gpus times --batch-gpu')
     if any(not metric_main.is_valid_metric(metric) for metric in c.metrics):
         raise click.ClickException('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
+    if opts.lambda_rank < 0:
+        raise click.ClickException('--lambda-rank must be non-negative')
+    if opts.lambda_adv < 0:
+        raise click.ClickException('--lambda-adv must be non-negative')
+    if opts.rank_margin <= 0:
+        raise click.ClickException('--rank-margin must be positive')
+    if opts.rank_score_reg < 0:
+        raise click.ClickException('--rank-score-reg must be non-negative')
 
             
     # Augmentation.
@@ -343,6 +366,32 @@ def main(**kwargs):
 
     # Description string.
     desc = f'{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}'
+    c.loss_kwargs.use_r1_penalty = not opts.disable_r1
+    c.loss_kwargs.use_r2_penalty = not opts.disable_r2
+    if opts.disable_r1:
+        desc += '-nor1'
+    if opts.disable_r2:
+        desc += '-nor2'
+    if opts.rank_replaces_adv:
+        opts.rank_loss = True
+        opts.lambda_adv = 0.0
+        desc += '-rankReplacesAdv'
+    if opts.rank_loss:
+        desc += '-rank'
+        c.loss_kwargs.rank_loss = True
+        c.loss_kwargs.rank_replaces_adv = opts.rank_replaces_adv
+        c.loss_kwargs.rank_K = opts.rank_k
+        c.loss_kwargs.rank_loss_type = opts.rank_loss_type
+        c.loss_kwargs.lambda_rank = opts.lambda_rank
+        c.loss_kwargs.lambda_adv = opts.lambda_adv
+        c.loss_kwargs.rank_mode = opts.rank_mode
+        c.loss_kwargs.rank_alpha_dist = opts.rank_alpha_dist
+        c.loss_kwargs.rank_augment = opts.rank_augment
+        c.loss_kwargs.rank_margin = opts.rank_margin
+        c.loss_kwargs.rank_score_reg = opts.rank_score_reg
+        desc += f'-{opts.rank_loss_type}'
+        if opts.rank_score_reg > 0:
+            desc += f'-scorereg{opts.rank_score_reg:g}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 
