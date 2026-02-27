@@ -4,3 +4,4 @@ __pycache__
 /.cache/
 /training-runs/
 *.sh
+download_models_from_box.py
