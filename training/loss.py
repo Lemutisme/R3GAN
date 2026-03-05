@@ -14,7 +14,8 @@ import torch.nn.functional as F
 from torch_utils import training_stats
 from R3GAN.Trainer import AdversarialTraining
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 def listmle_loss(scores_sorted: torch.Tensor) -> torch.Tensor:
     """ListMLE loss for [B, K] scores ordered best->worst."""
@@ -31,67 +32,101 @@ def pairwise_logistic_loss(scores_sorted: torch.Tensor) -> torch.Tensor:
     s_i = scores_sorted.unsqueeze(2)
     s_j = scores_sorted.unsqueeze(1)
     diff = s_i - s_j
-    mask = torch.triu(torch.ones(k, k, device=scores_sorted.device, dtype=scores_sorted.dtype), diagonal=1)
+    mask = torch.triu(
+        torch.ones(k, k, device=scores_sorted.device, dtype=scores_sorted.dtype),
+        diagonal=1,
+    )
     loss_all = F.softplus(-diff)
     return (loss_all * mask).sum() / (bsz * mask.sum())
 
 
-def pairwise_hinge_loss(scores_sorted: torch.Tensor, margin: float = 1.0) -> torch.Tensor:
+def pairwise_hinge_loss(
+    scores_sorted: torch.Tensor, margin: float = 1.0
+) -> torch.Tensor:
     """Pairwise hinge loss for [B, K] scores ordered best->worst."""
     bsz, k = scores_sorted.shape
     s_i = scores_sorted.unsqueeze(2)
     s_j = scores_sorted.unsqueeze(1)
     diff = s_i - s_j
-    mask = torch.triu(torch.ones(k, k, device=scores_sorted.device, dtype=scores_sorted.dtype), diagonal=1)
+    mask = torch.triu(
+        torch.ones(k, k, device=scores_sorted.device, dtype=scores_sorted.dtype),
+        diagonal=1,
+    )
     loss_all = F.relu(margin - diff)
     return (loss_all * mask).sum() / (bsz * mask.sum())
 
 
-def make_rank_list(real_imgs: torch.Tensor, fake_imgs: torch.Tensor, k: int,
-                   mode: str = 'intrpl', alpha_dist: str = 'linear') -> torch.Tensor:
+def make_rank_list(
+    real_imgs: torch.Tensor,
+    fake_imgs: torch.Tensor,
+    k: int,
+    mode: str = "intrpl",
+    alpha_dist: str = "linear",
+) -> torch.Tensor:
     """
     Build [B, K, C, H, W] list from real (index 0) to fake (index K-1).
     """
     device = real_imgs.device
-    if alpha_dist == 'linear':
+    if alpha_dist == "linear":
         alphas = torch.linspace(1.0, 0.0, k, device=device)
-    elif alpha_dist == 'cosine':
+    elif alpha_dist == "cosine":
         alphas = 0.5 * (1.0 + torch.cos(torch.linspace(0, np.pi, k, device=device)))
-    elif alpha_dist == 'random':
+    elif alpha_dist == "random":
         if k <= 2:
             alphas = torch.linspace(1.0, 0.0, k, device=device)
         else:
-            alphas = torch.cat([
-                torch.ones(1, device=device),
-                torch.rand(k - 2, device=device),
-                torch.zeros(1, device=device),
-            ])
+            alphas = torch.cat(
+                [
+                    torch.ones(1, device=device),
+                    torch.rand(k - 2, device=device),
+                    torch.zeros(1, device=device),
+                ]
+            )
             alphas = torch.sort(alphas, descending=True)[0]
     else:
         alphas = torch.linspace(1.0, 0.0, k, device=device)
 
     alphas = alphas.view(1, k, 1, 1, 1)
     interp = alphas * real_imgs.unsqueeze(1) + (1.0 - alphas) * fake_imgs.unsqueeze(1)
-    if mode == 'intrpl':
+    if mode == "intrpl":
         return interp
-    if mode == 'noise':
+    if mode == "noise":
         noise = torch.randn_like(real_imgs).unsqueeze(1) * 0.01
         noise_gain = alphas * (1.0 - alphas)
         return interp + noise_gain * noise
-    if mode == 'add_mix':
+    if mode == "add_mix":
         noise = torch.randn_like(real_imgs).unsqueeze(1) * 0.01
         noise_gain = 2.0 * alphas * (1.0 - alphas)
         return interp + noise_gain * noise
     return interp
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+
 
 class R3GANLoss:
-    def __init__(self, G, D, augment_pipe=None, rank_loss=False, rank_K=8, rank_loss_type='listmle',
-                 lambda_rank=0.1, lambda_adv=1.0, adv_loss_type='softmargin', adv_margin=0.0, adv_tau=0.07,
-                 rank_mode='intrpl', rank_alpha_dist='linear',
-                 rank_augment=False, rank_margin=1.0, rank_score_reg=0.0,
-                 use_r1_penalty=True, use_r2_penalty=True, use_non_aug_gp=False):
+    def __init__(
+        self,
+        G,
+        D,
+        augment_pipe=None,
+        rank_loss=False,
+        rank_K=8,
+        rank_loss_type="listmle",
+        lambda_rank=0.1,
+        lambda_adv=1.0,
+        adv_loss_type="softmargin",
+        adv_margin=0.0,
+        adv_tau=0.07,
+        rank_mode="intrpl",
+        rank_alpha_dist="linear",
+        rank_augment=False,
+        rank_margin=1.0,
+        rank_score_reg=0.0,
+        use_r1_penalty=True,
+        use_r2_penalty=True,
+        use_non_aug_gp=False,
+    ):
         self.G = G
         self.D = D
         self.trainer = AdversarialTraining(G, D)
@@ -125,114 +160,154 @@ class R3GANLoss:
 
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gamma, gain):
         # G
-        if phase == 'G':
-            AdversarialLoss, RelativisticLogits = self.trainer.AccumulateGeneratorGradients(
-                Noise=gen_z,
-                RealSamples=real_img,
-                Conditions=real_c,
-                Scale=gain,
-                Preprocessor=self.preprocessor,
-                Margin=self.adv_margin,
-                LossType=self.adv_loss_type,
-                Tau=self.adv_tau,
-                AdversarialScale=self.lambda_adv,
+        if phase == "G":
+            AdversarialLoss, RelativisticLogits = (
+                self.trainer.AccumulateGeneratorGradients(
+                    Noise=gen_z,
+                    RealSamples=real_img,
+                    Conditions=real_c,
+                    Scale=gain,
+                    Preprocessor=self.preprocessor,
+                    Margin=self.adv_margin,
+                    LossType=self.adv_loss_type,
+                    Tau=self.adv_tau,
+                    AdversarialScale=self.lambda_adv,
+                )
             )
 
             g_adv_term = self.lambda_adv * AdversarialLoss
-            training_stats.report('Loss/scores/fake', RelativisticLogits)
-            training_stats.report('Loss/signs/fake', RelativisticLogits.sign())
-            training_stats.report('Loss/G/loss', AdversarialLoss)
-            training_stats.report('Loss/G/adv_weighted', g_adv_term)
-            training_stats.report('Loss/G/total', g_adv_term)
-            if self.adv_loss_type == 'infonce':
-                training_stats.report('Loss/G/infonce', AdversarialLoss)
+            training_stats.report("Loss/scores/fake", RelativisticLogits)
+            training_stats.report("Loss/signs/fake", RelativisticLogits.sign())
+            training_stats.report("Loss/G/loss", AdversarialLoss)
+            training_stats.report("Loss/G/adv_weighted", g_adv_term)
+            training_stats.report("Loss/G/total", g_adv_term)
+            if self.adv_loss_type == "infonce":
+                training_stats.report("Loss/G/infonce", AdversarialLoss)
             else:
-                training_stats.report('Loss/G/infonce', torch.zeros_like(AdversarialLoss))
+                training_stats.report(
+                    "Loss/G/infonce", torch.zeros_like(AdversarialLoss)
+                )
             training_stats.report(
-                'Loss/adv_type_code',
-                torch.as_tensor(1.0 if self.adv_loss_type == 'infonce' else 0.0, device=real_img.device),
+                "Loss/adv_type_code",
+                torch.as_tensor(
+                    1.0 if self.adv_loss_type == "infonce" else 0.0,
+                    device=real_img.device,
+                ),
             )
-            training_stats.report('Loss/adv_tau', torch.as_tensor(self.adv_tau, device=real_img.device))
+            training_stats.report(
+                "Loss/adv_tau", torch.as_tensor(self.adv_tau, device=real_img.device)
+            )
 
         # D
-        if phase == 'D':
-            AdversarialLoss, RelativisticLogits, R1Penalty, R2Penalty = self.trainer.AccumulateDiscriminatorGradients(
-                Noise=gen_z,
-                RealSamples=real_img,
-                Conditions=real_c,
-                Gamma=gamma,
-                Scale=gain,
-                Preprocessor=self.preprocessor,
-                AdversarialScale=self.lambda_adv,
-                UseR1Penalty=self.use_r1_penalty,
-                UseR2Penalty=self.use_r2_penalty,
-                UseNonAugGP=self.use_non_aug_gp,
-                Margin=self.adv_margin,
-                LossType=self.adv_loss_type,
-                Tau=self.adv_tau,
+        if phase == "D":
+            AdversarialLoss, RelativisticLogits, R1Penalty, R2Penalty, FakeSamples = (
+                self.trainer.AccumulateDiscriminatorGradients(
+                    Noise=gen_z,
+                    RealSamples=real_img,
+                    Conditions=real_c,
+                    Gamma=gamma,
+                    Scale=gain,
+                    Preprocessor=self.preprocessor,
+                    AdversarialScale=self.lambda_adv,
+                    UseR1Penalty=self.use_r1_penalty,
+                    UseR2Penalty=self.use_r2_penalty,
+                    UseNonAugGP=self.use_non_aug_gp,
+                    Margin=self.adv_margin,
+                    LossType=self.adv_loss_type,
+                    Tau=self.adv_tau,
+                )
             )
 
             # Report decomposed D terms for easier diagnostics.
             adv_term = self.lambda_adv * AdversarialLoss
-            r1_term = (gamma / 2) * R1Penalty if self.use_r1_penalty else torch.zeros_like(AdversarialLoss)
-            r2_term = (gamma / 2) * R2Penalty if self.use_r2_penalty else torch.zeros_like(AdversarialLoss)
-            d_base_total = adv_term + r1_term + r2_term
-            d_rank_term = torch.zeros([], device=real_img.device, dtype=AdversarialLoss.dtype)
-
-            training_stats.report('Loss/scores/real', RelativisticLogits)
-            training_stats.report('Loss/signs/real', RelativisticLogits.sign())
-            training_stats.report('Loss/D/loss', AdversarialLoss)
-            training_stats.report('Loss/r1_penalty', R1Penalty)
-            training_stats.report('Loss/r2_penalty', R2Penalty)
-            training_stats.report('Loss/D/adv', AdversarialLoss)
-            training_stats.report('Loss/D/adv_weighted', adv_term)
-            training_stats.report('Loss/D/r1_weighted', r1_term)
-            training_stats.report('Loss/D/r2_weighted', r2_term)
-            training_stats.report('Loss/D/base_total', d_base_total)
-            if self.adv_loss_type == 'infonce':
-                training_stats.report('Loss/D/infonce', AdversarialLoss)
-            else:
-                training_stats.report('Loss/D/infonce', torch.zeros_like(AdversarialLoss))
-            training_stats.report(
-                'Loss/adv_type_code',
-                torch.as_tensor(1.0 if self.adv_loss_type == 'infonce' else 0.0, device=real_img.device),
+            r1_term = (
+                (gamma / 2) * R1Penalty
+                if self.use_r1_penalty
+                else torch.zeros_like(AdversarialLoss)
             )
-            training_stats.report('Loss/adv_tau', torch.as_tensor(self.adv_tau, device=real_img.device))
+            r2_term = (
+                (gamma / 2) * R2Penalty
+                if self.use_r2_penalty
+                else torch.zeros_like(AdversarialLoss)
+            )
+            d_base_total = adv_term + r1_term + r2_term
+            d_rank_term = torch.zeros(
+                [], device=real_img.device, dtype=AdversarialLoss.dtype
+            )
+
+            training_stats.report("Loss/scores/real", RelativisticLogits)
+            training_stats.report("Loss/signs/real", RelativisticLogits.sign())
+            training_stats.report("Loss/D/loss", AdversarialLoss)
+            training_stats.report("Loss/r1_penalty", R1Penalty)
+            training_stats.report("Loss/r2_penalty", R2Penalty)
+            training_stats.report("Loss/D/adv", AdversarialLoss)
+            training_stats.report("Loss/D/adv_weighted", adv_term)
+            training_stats.report("Loss/D/r1_weighted", r1_term)
+            training_stats.report("Loss/D/r2_weighted", r2_term)
+            training_stats.report("Loss/D/base_total", d_base_total)
+            if self.adv_loss_type == "infonce":
+                training_stats.report("Loss/D/infonce", AdversarialLoss)
+            else:
+                training_stats.report(
+                    "Loss/D/infonce", torch.zeros_like(AdversarialLoss)
+                )
+            training_stats.report(
+                "Loss/adv_type_code",
+                torch.as_tensor(
+                    1.0 if self.adv_loss_type == "infonce" else 0.0,
+                    device=real_img.device,
+                ),
+            )
+            training_stats.report(
+                "Loss/adv_tau", torch.as_tensor(self.adv_tau, device=real_img.device)
+            )
 
             if self.rank_loss:
-                with torch.no_grad():
-                    rank_fake_img = self.G(gen_z, real_c).detach()
+                rank_fake_img = FakeSamples
                 rank_imgs = make_rank_list(
-                    real_img, rank_fake_img,
-                    k=self.rank_K, mode=self.rank_mode, alpha_dist=self.rank_alpha_dist
+                    real_img,
+                    rank_fake_img,
+                    k=self.rank_K,
+                    mode=self.rank_mode,
+                    alpha_dist=self.rank_alpha_dist,
                 )
                 bsz, k, c, h, w = rank_imgs.shape
                 rank_imgs_flat = rank_imgs.reshape(bsz * k, c, h, w)
                 rank_c = real_c.repeat_interleave(k, dim=0)
-                rank_logits = self.run_D(rank_imgs_flat, rank_c, augment=self.rank_augment)
+                rank_logits = self.run_D(
+                    rank_imgs_flat, rank_c, augment=self.rank_augment
+                )
                 rank_logits = rank_logits.reshape(bsz, k, -1)
-                rank_scores = rank_logits.squeeze(-1) if rank_logits.shape[-1] == 1 else rank_logits.mean(dim=-1)
+                rank_scores = (
+                    rank_logits.squeeze(-1)
+                    if rank_logits.shape[-1] == 1
+                    else rank_logits.mean(dim=-1)
+                )
 
-                if self.rank_loss_type == 'listmle':
+                if self.rank_loss_type == "listmle":
                     loss_Drank = listmle_loss(rank_scores)
-                elif self.rank_loss_type == 'pairwise_logistic':
+                elif self.rank_loss_type == "pairwise_logistic":
                     loss_Drank = pairwise_logistic_loss(rank_scores)
-                elif self.rank_loss_type == 'pairwise_hinge':
-                    loss_Drank = pairwise_hinge_loss(rank_scores, margin=self.rank_margin)
+                elif self.rank_loss_type == "pairwise_hinge":
+                    loss_Drank = pairwise_hinge_loss(
+                        rank_scores, margin=self.rank_margin
+                    )
                 else:
                     loss_Drank = listmle_loss(rank_scores)
 
                 if self.rank_score_reg > 0:
                     score_reg = rank_scores.square().mean()
                     loss_Drank = loss_Drank + self.rank_score_reg * score_reg
-                    training_stats.report('Loss/D/score_reg', score_reg)
+                    training_stats.report("Loss/D/score_reg", score_reg)
 
-                training_stats.report('Loss/D/rank', loss_Drank)
+                training_stats.report("Loss/D/rank", loss_Drank)
                 d_rank_term = self.lambda_rank * loss_Drank
-                training_stats.report('Loss/D/rank_weighted', d_rank_term)
+                training_stats.report("Loss/D/rank_weighted", d_rank_term)
                 (gain * self.lambda_rank * loss_Drank).backward()
             else:
-                training_stats.report('Loss/D/rank_weighted', d_rank_term)
+                training_stats.report("Loss/D/rank_weighted", d_rank_term)
 
-            training_stats.report('Loss/D/total', d_base_total + d_rank_term)
-#----------------------------------------------------------------------------
+            training_stats.report("Loss/D/total", d_base_total + d_rank_term)
+
+
+# ----------------------------------------------------------------------------

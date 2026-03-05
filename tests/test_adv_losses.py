@@ -13,7 +13,10 @@ else:  # pragma: no cover
     AdversarialTraining = None
 
 
-@unittest.skipIf(torch is None or AdversarialTraining is None, 'PyTorch is not available in this environment')
+@unittest.skipIf(
+    torch is None or AdversarialTraining is None,
+    "PyTorch is not available in this environment",
+)
 class TestAdversarialLosses(unittest.TestCase):
     def test_softmargin_margin_zero_matches_rpgan(self):
         real = torch.randn(32)
@@ -22,14 +25,14 @@ class TestAdversarialLosses(unittest.TestCase):
         d_loss, d_rel = AdversarialTraining._discriminator_adv_loss(
             RealLogits=real,
             FakeLogits=fake,
-            LossType='softmargin',
+            LossType="softmargin",
             Margin=0.0,
             Tau=0.07,
         )
         g_loss, g_rel = AdversarialTraining._generator_adv_loss(
             FakeLogits=fake,
             RealLogits=real,
-            LossType='softmargin',
+            LossType="softmargin",
             Margin=0.0,
             Tau=0.07,
         )
@@ -46,14 +49,14 @@ class TestAdversarialLosses(unittest.TestCase):
         d_loss, d_rel = AdversarialTraining._discriminator_adv_loss(
             RealLogits=real,
             FakeLogits=fake,
-            LossType='infonce',
+            LossType="infonce",
             Margin=0.0,
             Tau=0.07,
         )
         g_loss, g_rel = AdversarialTraining._generator_adv_loss(
             FakeLogits=fake,
             RealLogits=real,
-            LossType='infonce',
+            LossType="infonce",
             Margin=0.0,
             Tau=0.07,
         )
@@ -65,6 +68,44 @@ class TestAdversarialLosses(unittest.TestCase):
         self.assertTrue(torch.isfinite(d_loss).all())
         self.assertTrue(torch.isfinite(g_loss).all())
 
+    def test_discriminator_returns_fake_samples(self):
+        """AccumulateDiscriminatorGradients should return 5 values including FakeSamples."""
+
+        class SimpleG(torch.nn.Module):
+            def __init__(self):
+                super(SimpleG, self).__init__()
+                self.fc = torch.nn.Linear(8, 3 * 4 * 4)
+
+            def forward(self, z, c):
+                return self.fc(z).reshape(z.shape[0], 3, 4, 4)
+
+        class SimpleD(torch.nn.Module):
+            def __init__(self):
+                super(SimpleD, self).__init__()
+                self.fc = torch.nn.Linear(3 * 4 * 4, 1)
+
+            def forward(self, x, c):
+                return self.fc(x.reshape(x.shape[0], -1)).squeeze(-1)
+
+        g = SimpleG()
+        d = SimpleD()
+        trainer = AdversarialTraining(g, d)
+        noise = torch.randn(4, 8)
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+
+        results = trainer.AccumulateDiscriminatorGradients(
+            Noise=noise,
+            RealSamples=real,
+            Conditions=cond,
+            Gamma=0.1,
+            Scale=1.0,
+        )
+        self.assertEqual(len(results), 5)
+        fake_samples = results[4]
+        self.assertEqual(fake_samples.shape, (4, 3, 4, 4))
+        self.assertFalse(fake_samples.requires_grad)  # Should be detached
+
     def test_infonce_requires_positive_tau(self):
         real = torch.randn(8)
         fake = torch.randn(8)
@@ -73,7 +114,7 @@ class TestAdversarialLosses(unittest.TestCase):
             AdversarialTraining._discriminator_adv_loss(
                 RealLogits=real,
                 FakeLogits=fake,
-                LossType='infonce',
+                LossType="infonce",
                 Margin=0.0,
                 Tau=0.0,
             )
@@ -82,11 +123,11 @@ class TestAdversarialLosses(unittest.TestCase):
             AdversarialTraining._generator_adv_loss(
                 FakeLogits=fake,
                 RealLogits=real,
-                LossType='infonce',
+                LossType="infonce",
                 Margin=0.0,
                 Tau=-1.0,
             )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
