@@ -168,6 +168,7 @@ def parse_comma_separated_list(s):
 @click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
 @click.option('--disable-r1',   help='Disable R1 gradient penalty on real images',              is_flag=True)
 @click.option('--disable-r2',   help='Disable R2 gradient penalty on generated images',         is_flag=True)
+@click.option('--non-aug-gp',   help='Compute R1/R2 on non-augmented samples', metavar='BOOL',  type=bool, default=False, show_default=True)
 
 # Rank loss options.
 @click.option('--rank-loss',       help='Enable ranking loss for D', metavar='BOOL',                 type=bool, default=False, show_default=True)
@@ -175,6 +176,9 @@ def parse_comma_separated_list(s):
 @click.option('--rank-loss-type',  help='Ranking loss type', type=click.Choice(['listmle', 'pairwise_logistic', 'pairwise_hinge']), default='listmle', show_default=True)
 @click.option('--lambda-rank',     help='Weight for ranking loss', type=float, default=0.1, show_default=True)
 @click.option('--lambda-adv',      help='Weight for adversarial loss (set 0 for pure rank ablation)', type=float, default=1.0, show_default=True)
+@click.option('--adv-loss-type',   help='Adversarial loss type', type=click.Choice(['softmargin', 'infonce']), default='softmargin', show_default=True)
+@click.option('--adv-margin',      help='Soft-margin for adversarial loss (0 reproduces RpGAN)', type=float, default=0.0, show_default=True)
+@click.option('--adv-tau',         help='Temperature for InfoNCE adversarial loss', type=float, default=0.07, show_default=True)
 @click.option('--rank-mode',       help='Interpolation mode for rank list', type=click.Choice(['intrpl', 'noise', 'add_mix']), default='intrpl', show_default=True)
 @click.option('--rank-alpha-dist', help='Alpha distribution for rank list', type=click.Choice(['linear', 'cosine', 'random']), default='linear', show_default=True)
 @click.option('--rank-augment',    help='Apply augmentation to rank images', metavar='BOOL',         type=bool, default=False, show_default=True)
@@ -191,6 +195,7 @@ def parse_comma_separated_list(s):
 @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=10000000, show_default=True)
 @click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
+@click.option('--snapshot-policy', help='Snapshot retention policy', type=click.Choice(['all', 'latest-best']), default='all', show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
@@ -331,6 +336,7 @@ def main(**kwargs):
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
+    c.snapshot_policy = opts.snapshot_policy
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
@@ -345,6 +351,10 @@ def main(**kwargs):
         raise click.ClickException('--lambda-rank must be non-negative')
     if opts.lambda_adv < 0:
         raise click.ClickException('--lambda-adv must be non-negative')
+    if opts.adv_margin < 0:
+        raise click.ClickException('--adv-margin must be non-negative')
+    if opts.adv_tau <= 0:
+        raise click.ClickException('--adv-tau must be positive')
     if opts.rank_margin <= 0:
         raise click.ClickException('--rank-margin must be positive')
     if opts.rank_score_reg < 0:
@@ -367,17 +377,27 @@ def main(**kwargs):
     desc = f'{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}'
     c.loss_kwargs.use_r1_penalty = not opts.disable_r1
     c.loss_kwargs.use_r2_penalty = not opts.disable_r2
+    c.loss_kwargs.use_non_aug_gp = opts.non_aug_gp
+    c.loss_kwargs.lambda_adv = opts.lambda_adv
+    c.loss_kwargs.adv_loss_type = opts.adv_loss_type
+    c.loss_kwargs.adv_margin = opts.adv_margin
+    c.loss_kwargs.adv_tau = opts.adv_tau
     if opts.disable_r1:
         desc += '-nor1'
     if opts.disable_r2:
         desc += '-nor2'
+    if opts.non_aug_gp:
+        desc += '-nonauggp'
+    if opts.adv_loss_type == 'infonce':
+        desc += f'-infonce-tau{opts.adv_tau:g}'
+    elif opts.adv_margin > 0:
+        desc += f'-advm{opts.adv_margin:g}'
     if opts.rank_loss:
         desc += '-rank'
         c.loss_kwargs.rank_loss = True
         c.loss_kwargs.rank_K = opts.rank_k
         c.loss_kwargs.rank_loss_type = opts.rank_loss_type
         c.loss_kwargs.lambda_rank = opts.lambda_rank
-        c.loss_kwargs.lambda_adv = opts.lambda_adv
         c.loss_kwargs.rank_mode = opts.rank_mode
         c.loss_kwargs.rank_alpha_dist = opts.rank_alpha_dist
         c.loss_kwargs.rank_augment = opts.rank_augment

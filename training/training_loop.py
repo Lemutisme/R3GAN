@@ -141,6 +141,7 @@ def training_loop(
     kimg_per_tick           = 4,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
+    snapshot_policy         = 'all',    # Snapshot retention policy: 'all' or 'latest-best'.
     resume_pkl              = None,     # Network pickle to resume training from.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
@@ -260,6 +261,26 @@ def training_loop(
             stats_tfevents = tensorboard.SummaryWriter(run_dir)
         except ImportError as err:
             print('Skipping tfevents export:', err)
+
+    # Snapshot retention state.
+    latest_snapshot_pkl = None
+    latest_image_png = None
+    best_snapshot_pkl = None
+    best_image_png = None
+    best_metric_name = metrics[0] if len(metrics) > 0 else None
+    best_metric_value = None
+
+    def _is_better_metric(metric_name, candidate, reference):
+        # FID/KID are lower-is-better; most others are higher-is-better.
+        if metric_name.startswith('fid') or metric_name.startswith('kid'):
+            return candidate < reference
+        return candidate > reference
+
+    def _safe_remove(path, protected):
+        if path is None or path in protected:
+            return
+        if os.path.isfile(path):
+            os.remove(path)
 
     # Train.
     if rank == 0:
@@ -393,15 +414,24 @@ def training_loop(
                 print()
                 print('Aborting...')
 
+        # Decide this tick's snapshot actions.
+        save_network_this_tick = (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0)
+        save_image_this_tick = (rank == 0) and (
+            ((image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0)) or
+            (snapshot_policy == 'latest-best' and save_network_this_tick)
+        )
+
         # Save image snapshot.
-        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+        image_snapshot_path = None
+        if save_image_this_tick:
             images = torch.cat([G_ema(z, c).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:09d}.png'), drange=[-1,1], grid_size=grid_size)
+            image_snapshot_path = os.path.join(run_dir, f'fakes{cur_nimg//1000:09d}.png')
+            save_image_grid(images, image_snapshot_path, drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
-        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+        if save_network_this_tick:
             snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs), cur_nimg=cur_nimg)
             for phase in phases:
                 snapshot_data[phase.name + '_opt_state'] = remap_optimizer_state_dict(phase.opt.state_dict(), 'cpu')
@@ -420,6 +450,7 @@ def training_loop(
                     pickle.dump(snapshot_data, f)
 
         # Evaluate metrics.
+        snapshot_metric_results = dict()
         if (snapshot_data is not None) and (len(metrics) > 0):
             if rank == 0:
                 print('Evaluating metrics...')
@@ -429,7 +460,40 @@ def training_loop(
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)
+                snapshot_metric_results.update(result_dict.results)
         del snapshot_data # conserve memory
+
+        # Keep only latest and best checkpoint/image pairs when enabled.
+        if (rank == 0) and (snapshot_policy == 'latest-best') and (snapshot_pkl is not None):
+            is_best = False
+            metric_value = None
+
+            if (best_metric_name is not None) and (best_metric_name in snapshot_metric_results):
+                metric_value = snapshot_metric_results[best_metric_name]
+                if (best_metric_value is None) or _is_better_metric(best_metric_name, metric_value, best_metric_value):
+                    is_best = True
+            elif best_snapshot_pkl is None:
+                # If no metric is available, keep first snapshot as the current best.
+                is_best = True
+
+            prev_best_snapshot_pkl = best_snapshot_pkl
+            prev_best_image_png = best_image_png
+
+            if is_best:
+                best_snapshot_pkl = snapshot_pkl
+                best_image_png = image_snapshot_path
+                if metric_value is not None:
+                    best_metric_value = metric_value
+                    print(f'Updated best snapshot by {best_metric_name}: {best_metric_value:.6f}')
+
+            protected = {snapshot_pkl, image_snapshot_path, best_snapshot_pkl, best_image_png}
+            _safe_remove(latest_snapshot_pkl, protected)
+            _safe_remove(latest_image_png, protected)
+            _safe_remove(prev_best_snapshot_pkl, protected)
+            _safe_remove(prev_best_image_png, protected)
+
+            latest_snapshot_pkl = snapshot_pkl
+            latest_image_png = image_snapshot_path
 
         # Collect statistics.
         for phase in phases:

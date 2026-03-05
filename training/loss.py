@@ -88,9 +88,10 @@ def make_rank_list(real_imgs: torch.Tensor, fake_imgs: torch.Tensor, k: int,
 
 class R3GANLoss:
     def __init__(self, G, D, augment_pipe=None, rank_loss=False, rank_K=8, rank_loss_type='listmle',
-                 lambda_rank=0.1, lambda_adv=1.0, rank_mode='intrpl', rank_alpha_dist='linear',
+                 lambda_rank=0.1, lambda_adv=1.0, adv_loss_type='softmargin', adv_margin=0.0, adv_tau=0.07,
+                 rank_mode='intrpl', rank_alpha_dist='linear',
                  rank_augment=False, rank_margin=1.0, rank_score_reg=0.0,
-                 use_r1_penalty=True, use_r2_penalty=True):
+                 use_r1_penalty=True, use_r2_penalty=True, use_non_aug_gp=False):
         self.G = G
         self.D = D
         self.trainer = AdversarialTraining(G, D)
@@ -105,6 +106,9 @@ class R3GANLoss:
         self.rank_loss_type = rank_loss_type
         self.lambda_rank = lambda_rank
         self.lambda_adv = lambda_adv
+        self.adv_loss_type = adv_loss_type
+        self.adv_margin = adv_margin
+        self.adv_tau = adv_tau
         self.rank_mode = rank_mode
         self.rank_alpha_dist = rank_alpha_dist
         self.rank_augment = rank_augment
@@ -112,6 +116,7 @@ class R3GANLoss:
         self.rank_score_reg = rank_score_reg
         self.use_r1_penalty = use_r1_penalty
         self.use_r2_penalty = use_r2_penalty
+        self.use_non_aug_gp = use_non_aug_gp
 
     def run_D(self, img, c, augment=True):
         if augment and self.augment_pipe is not None:
@@ -121,17 +126,50 @@ class R3GANLoss:
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gamma, gain):
         # G
         if phase == 'G':
-            AdversarialLoss, RelativisticLogits = self.trainer.AccumulateGeneratorGradients(gen_z, real_img, real_c, gain, self.preprocessor)
+            AdversarialLoss, RelativisticLogits = self.trainer.AccumulateGeneratorGradients(
+                Noise=gen_z,
+                RealSamples=real_img,
+                Conditions=real_c,
+                Scale=gain,
+                Preprocessor=self.preprocessor,
+                Margin=self.adv_margin,
+                LossType=self.adv_loss_type,
+                Tau=self.adv_tau,
+                AdversarialScale=self.lambda_adv,
+            )
 
+            g_adv_term = self.lambda_adv * AdversarialLoss
             training_stats.report('Loss/scores/fake', RelativisticLogits)
             training_stats.report('Loss/signs/fake', RelativisticLogits.sign())
             training_stats.report('Loss/G/loss', AdversarialLoss)
+            training_stats.report('Loss/G/adv_weighted', g_adv_term)
+            training_stats.report('Loss/G/total', g_adv_term)
+            if self.adv_loss_type == 'infonce':
+                training_stats.report('Loss/G/infonce', AdversarialLoss)
+            else:
+                training_stats.report('Loss/G/infonce', torch.zeros_like(AdversarialLoss))
+            training_stats.report(
+                'Loss/adv_type_code',
+                torch.as_tensor(1.0 if self.adv_loss_type == 'infonce' else 0.0, device=real_img.device),
+            )
+            training_stats.report('Loss/adv_tau', torch.as_tensor(self.adv_tau, device=real_img.device))
 
         # D
         if phase == 'D':
             AdversarialLoss, RelativisticLogits, R1Penalty, R2Penalty = self.trainer.AccumulateDiscriminatorGradients(
-                gen_z, real_img, real_c, gamma, gain, self.preprocessor, self.lambda_adv,
-                self.use_r1_penalty, self.use_r2_penalty
+                Noise=gen_z,
+                RealSamples=real_img,
+                Conditions=real_c,
+                Gamma=gamma,
+                Scale=gain,
+                Preprocessor=self.preprocessor,
+                AdversarialScale=self.lambda_adv,
+                UseR1Penalty=self.use_r1_penalty,
+                UseR2Penalty=self.use_r2_penalty,
+                UseNonAugGP=self.use_non_aug_gp,
+                Margin=self.adv_margin,
+                LossType=self.adv_loss_type,
+                Tau=self.adv_tau,
             )
 
             # Report decomposed D terms for easier diagnostics.
@@ -151,6 +189,15 @@ class R3GANLoss:
             training_stats.report('Loss/D/r1_weighted', r1_term)
             training_stats.report('Loss/D/r2_weighted', r2_term)
             training_stats.report('Loss/D/base_total', d_base_total)
+            if self.adv_loss_type == 'infonce':
+                training_stats.report('Loss/D/infonce', AdversarialLoss)
+            else:
+                training_stats.report('Loss/D/infonce', torch.zeros_like(AdversarialLoss))
+            training_stats.report(
+                'Loss/adv_type_code',
+                torch.as_tensor(1.0 if self.adv_loss_type == 'infonce' else 0.0, device=real_img.device),
+            )
+            training_stats.report('Loss/adv_tau', torch.as_tensor(self.adv_tau, device=real_img.device))
 
             if self.rank_loss:
                 with torch.no_grad():
