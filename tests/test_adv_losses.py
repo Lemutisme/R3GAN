@@ -129,5 +129,91 @@ class TestAdversarialLosses(unittest.TestCase):
             )
 
 
+@unittest.skipIf(
+    torch is None or AdversarialTraining is None,
+    "PyTorch is not available in this environment",
+)
+class TestInfoNCEBuffering(unittest.TestCase):
+    def test_infonce_logsumexp_uses_full_batch(self):
+        real = torch.tensor([1.0, 0.5, -0.5, -1.0])
+        fake = torch.tensor([0.8, 0.3, -0.3, -0.8])
+        tau = 1.0
+        d_loss_full, _ = AdversarialTraining._discriminator_adv_loss(
+            RealLogits=real,
+            FakeLogits=fake,
+            LossType="infonce",
+            Tau=tau,
+        )
+        d_loss_micro1, _ = AdversarialTraining._discriminator_adv_loss(
+            RealLogits=real[:2],
+            FakeLogits=fake[:2],
+            LossType="infonce",
+            Tau=tau,
+        )
+        d_loss_micro2, _ = AdversarialTraining._discriminator_adv_loss(
+            RealLogits=real[2:],
+            FakeLogits=fake[2:],
+            LossType="infonce",
+            Tau=tau,
+        )
+        d_loss_micro_avg = 0.5 * d_loss_micro1.mean() + 0.5 * d_loss_micro2.mean()
+        self.assertFalse(
+            torch.allclose(d_loss_full.mean(), d_loss_micro_avg, atol=1e-4),
+            "InfoNCE micro-batch should differ from full-batch (logsumexp scope differs)",
+        )
+
+
+@unittest.skipIf(torch is None, "PyTorch is not available in this environment")
+class TestR3GANLossBuffering(unittest.TestCase):
+    def _make_loss(self, adv_loss_type="infonce", tau=0.07):
+        from training.loss import R3GANLoss
+
+        class TinyG(torch.nn.Module):
+            def __init__(self):
+                super(TinyG, self).__init__()
+                self.fc = torch.nn.Linear(4, 3 * 4 * 4)
+
+            def forward(self, z, c):
+                return self.fc(z).reshape(z.shape[0], 3, 4, 4)
+
+        class TinyD(torch.nn.Module):
+            def __init__(self):
+                super(TinyD, self).__init__()
+                self.fc = torch.nn.Linear(3 * 4 * 4, 1)
+
+            def forward(self, x, c):
+                return self.fc(x.reshape(x.shape[0], -1)).squeeze(-1)
+
+        g = TinyG()
+        d = TinyD()
+        return R3GANLoss(G=g, D=d, adv_loss_type=adv_loss_type, adv_tau=tau)
+
+    def test_finalize_noop_for_softmargin(self):
+        loss_obj = self._make_loss(adv_loss_type="softmargin")
+        loss_obj.finalize_accumulation()  # Should not raise
+
+    def test_infonce_buffers_then_flushes(self):
+        loss_obj = self._make_loss(adv_loss_type="infonce")
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+        # First call: should buffer, no backward yet
+        loss_obj.accumulate_gradients(
+            "D", real[:2], cond[:2], noise[:2], gamma=0.1, gain=0.5
+        )
+        for p in loss_obj.D.parameters():
+            self.assertIsNone(p.grad)
+        # Second call: still buffering
+        loss_obj.accumulate_gradients(
+            "D", real[2:], cond[2:], noise[2:], gamma=0.1, gain=0.5
+        )
+        for p in loss_obj.D.parameters():
+            self.assertIsNone(p.grad)
+        # Finalize: should process full batch and produce gradients
+        loss_obj.finalize_accumulation()
+        has_grad = any(p.grad is not None for p in loss_obj.D.parameters())
+        self.assertTrue(has_grad, "D should have gradients after finalize_accumulation")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -152,6 +152,7 @@ class R3GANLoss:
         self.use_r1_penalty = use_r1_penalty
         self.use_r2_penalty = use_r2_penalty
         self.use_non_aug_gp = use_non_aug_gp
+        self._infonce_buffer = None
 
     def run_D(self, img, c, augment=True):
         if augment and self.augment_pipe is not None:
@@ -159,6 +160,46 @@ class R3GANLoss:
         return self.D(img, c)
 
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gamma, gain):
+        # InfoNCE requires full-batch logits for correct logsumexp normalization.
+        # Buffer micro-batch data and process in finalize_accumulation().
+        # Softmargin (pairwise) losses are micro-batch-equivalent, no buffering needed.
+        if self.adv_loss_type == "infonce":
+            if self._infonce_buffer is None:
+                self._infonce_buffer = {
+                    "phase": phase,
+                    "gamma": gamma,
+                    "real_imgs": [],
+                    "real_cs": [],
+                    "gen_zs": [],
+                    "gains": [],
+                }
+            self._infonce_buffer["real_imgs"].append(real_img)
+            self._infonce_buffer["real_cs"].append(real_c)
+            self._infonce_buffer["gen_zs"].append(gen_z)
+            self._infonce_buffer["gains"].append(gain)
+            return
+        self._accumulate_gradients_impl(phase, real_img, real_c, gen_z, gamma, gain)
+
+    def finalize_accumulation(self):
+        """Flush buffered micro-batches for full-batch InfoNCE. No-op for pairwise losses."""
+        if self._infonce_buffer is None:
+            return
+        buf = self._infonce_buffer
+        self._infonce_buffer = None
+        merged_real = torch.cat(buf["real_imgs"])
+        merged_c = torch.cat(buf["real_cs"])
+        merged_z = torch.cat(buf["gen_zs"])
+        merged_gain = sum(buf["gains"])
+        self._accumulate_gradients_impl(
+            buf["phase"],
+            merged_real,
+            merged_c,
+            merged_z,
+            buf["gamma"],
+            merged_gain,
+        )
+
+    def _accumulate_gradients_impl(self, phase, real_img, real_c, gen_z, gamma, gain):
         # G
         if phase == "G":
             AdversarialLoss, RelativisticLogits = (
