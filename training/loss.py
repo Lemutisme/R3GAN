@@ -15,6 +15,12 @@ from torch_utils import training_stats
 from R3GAN.Trainer import AdversarialTraining
 
 # ----------------------------------------------------------------------------
+# EXPERIMENTAL: Interpolation-based ranking losses.
+# These auxiliary losses build an interpolation chain between real and fake
+# images and teach D to rank them.  They are NOT the recommended approach;
+# prefer --adv-loss-type=softmargin (with --adv-margin>0) or infonce instead.
+# Kept for reproducibility of earlier experiments.
+# ----------------------------------------------------------------------------
 
 
 def listmle_loss(scores_sorted: torch.Tensor) -> torch.Tensor:
@@ -155,8 +161,8 @@ class R3GANLoss:
         self._infonce_buffer = None
 
     def run_D(self, img, c, augment=True):
-        if augment and self.augment_pipe is not None:
-            img = self.augment_pipe(img.to(torch.float32)).to(img.dtype)
+        if augment:
+            img = self.preprocessor(img)
         return self.D(img, c)
 
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gamma, gain):
@@ -272,16 +278,13 @@ class R3GANLoss:
                 else torch.zeros_like(AdversarialLoss)
             )
             d_base_total = adv_term + r1_term + r2_term
-            d_rank_term = torch.zeros(
-                [], device=real_img.device, dtype=AdversarialLoss.dtype
-            )
+            d_rank_term = torch.zeros_like(AdversarialLoss)
 
             training_stats.report("Loss/scores/real", RelativisticLogits)
             training_stats.report("Loss/signs/real", RelativisticLogits.sign())
             training_stats.report("Loss/D/loss", AdversarialLoss)
             training_stats.report("Loss/r1_penalty", R1Penalty)
             training_stats.report("Loss/r2_penalty", R2Penalty)
-            training_stats.report("Loss/D/adv", AdversarialLoss)
             training_stats.report("Loss/D/adv_weighted", adv_term)
             training_stats.report("Loss/D/r1_weighted", r1_term)
             training_stats.report("Loss/D/r2_weighted", r2_term)
@@ -326,25 +329,25 @@ class R3GANLoss:
                 )
 
                 if self.rank_loss_type == "listmle":
-                    loss_Drank = listmle_loss(rank_scores)
+                    loss_d_rank = listmle_loss(rank_scores)
                 elif self.rank_loss_type == "pairwise_logistic":
-                    loss_Drank = pairwise_logistic_loss(rank_scores)
+                    loss_d_rank = pairwise_logistic_loss(rank_scores)
                 elif self.rank_loss_type == "pairwise_hinge":
-                    loss_Drank = pairwise_hinge_loss(
+                    loss_d_rank = pairwise_hinge_loss(
                         rank_scores, margin=self.rank_margin
                     )
                 else:
-                    loss_Drank = listmle_loss(rank_scores)
+                    raise ValueError(f"Unknown rank_loss_type: {self.rank_loss_type}")
 
                 if self.rank_score_reg > 0:
                     score_reg = rank_scores.square().mean()
-                    loss_Drank = loss_Drank + self.rank_score_reg * score_reg
+                    loss_d_rank = loss_d_rank + self.rank_score_reg * score_reg
                     training_stats.report("Loss/D/score_reg", score_reg)
 
-                training_stats.report("Loss/D/rank", loss_Drank)
-                d_rank_term = self.lambda_rank * loss_Drank
+                training_stats.report("Loss/D/rank", loss_d_rank)
+                d_rank_term = self.lambda_rank * loss_d_rank
                 training_stats.report("Loss/D/rank_weighted", d_rank_term)
-                (gain * self.lambda_rank * loss_Drank).backward()
+                (gain * self.lambda_rank * loss_d_rank).backward()
             else:
                 training_stats.report("Loss/D/rank_weighted", d_rank_term)
 

@@ -20,40 +20,57 @@ from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 def subprocess_fn(rank, c, temp_dir):
-    dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
+    dnnlib.util.Logger(
+        file_name=os.path.join(c.run_dir, "log.txt"), file_mode="a", should_flush=True
+    )
 
     # Init torch.distributed.
     if c.num_gpus > 1:
-        init_file = os.path.abspath(os.path.join(temp_dir, '.torch_distributed_init'))
-        if os.name == 'nt':
-            init_method = 'file:///' + init_file.replace('\\', '/')
-            torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=c.num_gpus)
+        init_file = os.path.abspath(os.path.join(temp_dir, ".torch_distributed_init"))
+        if os.name == "nt":
+            init_method = "file:///" + init_file.replace("\\", "/")
+            torch.distributed.init_process_group(
+                backend="gloo",
+                init_method=init_method,
+                rank=rank,
+                world_size=c.num_gpus,
+            )
         else:
-            init_method = f'file://{init_file}'
-            torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
+            init_method = f"file://{init_file}"
+            torch.distributed.init_process_group(
+                backend="nccl",
+                init_method=init_method,
+                rank=rank,
+                world_size=c.num_gpus,
+            )
 
     # Init torch_utils.
-    sync_device = torch.device('cuda', rank) if c.num_gpus > 1 else None
+    sync_device = torch.device("cuda", rank) if c.num_gpus > 1 else None
     training_stats.init_multiprocessing(rank=rank, sync_device=sync_device)
     if rank != 0:
-        custom_ops.verbosity = 'none'
+        custom_ops.verbosity = "none"
 
     # Execute training loop.
     training_loop.training_loop(rank=rank, **c)
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+
 
 def build_custom_ops_or_die():
     """Build required fused CUDA ops once before spawning worker processes."""
     # Use a writable cache directory by default so extension build artifacts
     # are stable across runs and do not depend on the host user's home config.
-    if 'TORCH_EXTENSIONS_DIR' not in os.environ:
+    if "TORCH_EXTENSIONS_DIR" not in os.environ:
         repo_root = os.path.dirname(os.path.abspath(__file__))
-        os.environ['TORCH_EXTENSIONS_DIR'] = os.path.join(repo_root, '.cache', 'torch_extensions')
-    os.makedirs(os.environ['TORCH_EXTENSIONS_DIR'], exist_ok=True)
+        os.environ["TORCH_EXTENSIONS_DIR"] = os.path.join(
+            repo_root, ".cache", "torch_extensions"
+        )
+    os.makedirs(os.environ["TORCH_EXTENSIONS_DIR"], exist_ok=True)
 
     try:
         verify_ninja_availability()
@@ -67,12 +84,14 @@ def build_custom_ops_or_die():
             raise RuntimeError('Failed to build or load "upfirdn2d_plugin".')
     except Exception as err:
         raise click.ClickException(
-            'Custom CUDA ops prebuild failed. '
-            'Please run `bash scripts/build_custom_ops.sh` to diagnose and fix the toolchain, '
-            f'then retry training.\nOriginal error: {err}'
+            "Custom CUDA ops prebuild failed. "
+            "Please run `bash scripts/build_custom_ops.sh` to diagnose and fix the toolchain, "
+            f"then retry training.\nOriginal error: {err}"
         ) from err
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+
 
 def launch_training(c, desc, outdir, dry_run):
     dnnlib.util.Logger(should_flush=True)
@@ -80,145 +99,363 @@ def launch_training(c, desc, outdir, dry_run):
     # Pick output directory.
     prev_run_dirs = []
     if os.path.isdir(outdir):
-        prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
-    prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
+        prev_run_dirs = [
+            x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))
+        ]
+    prev_run_ids = [re.match(r"^\d+", x) for x in prev_run_dirs]
     prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
     cur_run_id = max(prev_run_ids, default=-1) + 1
-    c.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
+    c.run_dir = os.path.join(outdir, f"{cur_run_id:05d}-{desc}")
     assert not os.path.exists(c.run_dir)
 
     # Print options.
     print()
-    print('Training options:')
+    print("Training options:")
     print(json.dumps(c, indent=2))
     print()
-    print(f'Output directory:    {c.run_dir}')
-    print(f'Number of GPUs:      {c.num_gpus}')
-    print(f'Batch size:          {c.batch_size} images')
-    print(f'Training duration:   {c.total_kimg} kimg')
-    print(f'Dataset path:        {c.training_set_kwargs.path}')
-    print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
-    print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
-    print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
-    print(f'Dataset x-flips:     {c.training_set_kwargs.xflip}')
+    print(f"Output directory:    {c.run_dir}")
+    print(f"Number of GPUs:      {c.num_gpus}")
+    print(f"Batch size:          {c.batch_size} images")
+    print(f"Training duration:   {c.total_kimg} kimg")
+    print(f"Dataset path:        {c.training_set_kwargs.path}")
+    print(f"Dataset size:        {c.training_set_kwargs.max_size} images")
+    print(f"Dataset resolution:  {c.training_set_kwargs.resolution}")
+    print(f"Dataset labels:      {c.training_set_kwargs.use_labels}")
+    print(f"Dataset x-flips:     {c.training_set_kwargs.xflip}")
     print()
 
     # Dry run?
     if dry_run:
-        print('Dry run; exiting.')
+        print("Dry run; exiting.")
         return
 
     # Create output directory.
-    print('Creating output directory...')
+    print("Creating output directory...")
     os.makedirs(c.run_dir)
-    with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
+    with open(os.path.join(c.run_dir, "training_options.json"), "wt") as f:
         json.dump(c, f, indent=2)
 
     # Build fused CUDA ops once in the parent process, then spawn workers.
     # This avoids repeated builds and surfaces environment issues early.
-    print('Prebuilding custom CUDA ops...')
+    print("Prebuilding custom CUDA ops...")
     build_custom_ops_or_die()
 
     # Launch processes.
-    print('Launching processes...')
-    torch.multiprocessing.set_start_method('spawn')
+    print("Launching processes...")
+    torch.multiprocessing.set_start_method("spawn")
     with tempfile.TemporaryDirectory() as temp_dir:
         if c.num_gpus == 1:
             subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
+            torch.multiprocessing.spawn(
+                fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus
+            )
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+
 
 def init_dataset_kwargs(data):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
-        dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
-        dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
-        dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
-        dataset_kwargs.max_size = len(dataset_obj) # Be explicit about dataset size.
+        dataset_kwargs = dnnlib.EasyDict(
+            class_name="training.dataset.ImageFolderDataset",
+            path=data,
+            use_labels=True,
+            max_size=None,
+            xflip=False,
+        )
+        dataset_obj = dnnlib.util.construct_class_by_name(
+            **dataset_kwargs
+        )  # Subclass of training.dataset.Dataset.
+        dataset_kwargs.resolution = (
+            dataset_obj.resolution
+        )  # Be explicit about resolution.
+        dataset_kwargs.use_labels = dataset_obj.has_labels  # Be explicit about labels.
+        dataset_kwargs.max_size = len(dataset_obj)  # Be explicit about dataset size.
         return dataset_kwargs, dataset_obj.name
     except IOError as err:
-        raise click.ClickException(f'--data: {err}')
+        raise click.ClickException(f"--data: {err}")
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+
 
 def parse_comma_separated_list(s):
     if isinstance(s, list):
         return s
-    if s is None or s.lower() == 'none' or s == '':
+    if s is None or s.lower() == "none" or s == "":
         return []
-    return s.split(',')
+    return s.split(",")
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+
 
 @click.command()
-
 # Required.
-@click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
-@click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
-@click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
-@click.option('--preset',       help='Preset configs', metavar='STR',                           type=str, required=True)
-
+@click.option(
+    "--outdir", help="Where to save the results", metavar="DIR", required=True
+)
+@click.option(
+    "--data", help="Training data", metavar="[ZIP|DIR]", type=str, required=True
+)
+@click.option(
+    "--gpus",
+    help="Number of GPUs to use",
+    metavar="INT",
+    type=click.IntRange(min=1),
+    required=True,
+)
+@click.option(
+    "--batch",
+    help="Total batch size",
+    metavar="INT",
+    type=click.IntRange(min=1),
+    required=True,
+)
+@click.option("--preset", help="Preset configs", metavar="STR", type=str, required=True)
 # Optional features.
-@click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
-@click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  type=bool, default=False, show_default=True)
-@click.option('--aug',          help='Enable Augmentation', metavar='BOOL',                     type=bool, default=True, show_default=True)
-@click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
-@click.option('--disable-r1',   help='Disable R1 gradient penalty on real images',              is_flag=True)
-@click.option('--disable-r2',   help='Disable R2 gradient penalty on generated images',         is_flag=True)
-@click.option('--non-aug-gp',   help='Compute R1/R2 on non-augmented samples', metavar='BOOL',  type=bool, default=False, show_default=True)
-
+@click.option(
+    "--cond",
+    help="Train conditional model",
+    metavar="BOOL",
+    type=bool,
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--mirror",
+    help="Enable dataset x-flips",
+    metavar="BOOL",
+    type=bool,
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--aug",
+    help="Enable Augmentation",
+    metavar="BOOL",
+    type=bool,
+    default=True,
+    show_default=True,
+)
+@click.option(
+    "--resume", help="Resume from given network pickle", metavar="[PATH|URL]", type=str
+)
+@click.option(
+    "--disable-r1", help="Disable R1 gradient penalty on real images", is_flag=True
+)
+@click.option(
+    "--disable-r2", help="Disable R2 gradient penalty on generated images", is_flag=True
+)
+@click.option(
+    "--non-aug-gp",
+    help="Compute R1/R2 on non-augmented samples (recommended for convergence guarantees; adds extra D forward passes)",
+    metavar="BOOL",
+    type=bool,
+    default=False,
+    show_default=True,
+)
 # Rank loss options.
-@click.option('--rank-loss',       help='Enable ranking loss for D', metavar='BOOL',                 type=bool, default=False, show_default=True)
-@click.option('--rank-k',          help='Number of interpolation steps for ranking', metavar='INT',  type=click.IntRange(min=2), default=8, show_default=True)
-@click.option('--rank-loss-type',  help='Ranking loss type', type=click.Choice(['listmle', 'pairwise_logistic', 'pairwise_hinge']), default='listmle', show_default=True)
-@click.option('--lambda-rank',     help='Weight for ranking loss', type=float, default=0.1, show_default=True)
-@click.option('--lambda-adv',      help='Weight for adversarial loss (set 0 for pure rank ablation)', type=float, default=1.0, show_default=True)
-@click.option('--adv-loss-type',   help='Adversarial loss type', type=click.Choice(['softmargin', 'infonce']), default='softmargin', show_default=True)
-@click.option('--adv-margin',      help='Soft-margin for adversarial loss (0 reproduces RpGAN)', type=float, default=0.0, show_default=True)
-@click.option('--adv-tau',         help='Temperature for InfoNCE adversarial loss', type=float, default=0.07, show_default=True)
-@click.option('--rank-mode',       help='Interpolation mode for rank list', type=click.Choice(['intrpl', 'noise', 'add_mix']), default='intrpl', show_default=True)
-@click.option('--rank-alpha-dist', help='Alpha distribution for rank list', type=click.Choice(['linear', 'cosine', 'random']), default='linear', show_default=True)
-@click.option('--rank-augment',    help='Apply augmentation to rank images', metavar='BOOL',         type=bool, default=False, show_default=True)
-@click.option('--rank-margin',     help='Margin for pairwise hinge rank loss', type=float, default=1.0, show_default=True)
-@click.option('--rank-score-reg',  help='Score regularization weight for rank loss (lambda*mean(scores^2))', type=float, default=0.0, show_default=True)
-
+@click.option(
+    "--rank-loss",
+    help="Enable ranking loss for D",
+    metavar="BOOL",
+    type=bool,
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--rank-k",
+    help="Number of interpolation steps for ranking",
+    metavar="INT",
+    type=click.IntRange(min=2),
+    default=8,
+    show_default=True,
+)
+@click.option(
+    "--rank-loss-type",
+    help="Ranking loss type",
+    type=click.Choice(["listmle", "pairwise_logistic", "pairwise_hinge"]),
+    default="listmle",
+    show_default=True,
+)
+@click.option(
+    "--lambda-rank",
+    help="Weight for ranking loss",
+    type=float,
+    default=0.1,
+    show_default=True,
+)
+@click.option(
+    "--lambda-adv",
+    help="Weight for adversarial loss (set 0 for pure rank ablation)",
+    type=float,
+    default=1.0,
+    show_default=True,
+)
+@click.option(
+    "--adv-loss-type",
+    help="Adversarial loss type",
+    type=click.Choice(["softmargin", "infonce"]),
+    default="softmargin",
+    show_default=True,
+)
+@click.option(
+    "--adv-margin",
+    help="Soft-margin for adversarial loss (0 reproduces RpGAN)",
+    type=float,
+    default=0.0,
+    show_default=True,
+)
+@click.option(
+    "--adv-tau",
+    help="Temperature for InfoNCE adversarial loss",
+    type=float,
+    default=0.07,
+    show_default=True,
+)
+@click.option(
+    "--rank-mode",
+    help="Interpolation mode for rank list",
+    type=click.Choice(["intrpl", "noise", "add_mix"]),
+    default="intrpl",
+    show_default=True,
+)
+@click.option(
+    "--rank-alpha-dist",
+    help="Alpha distribution for rank list",
+    type=click.Choice(["linear", "cosine", "random"]),
+    default="linear",
+    show_default=True,
+)
+@click.option(
+    "--rank-augment",
+    help="Apply augmentation to rank images",
+    metavar="BOOL",
+    type=bool,
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--rank-margin",
+    help="Margin for pairwise hinge rank loss",
+    type=float,
+    default=1.0,
+    show_default=True,
+)
+@click.option(
+    "--rank-score-reg",
+    help="Score regularization weight for rank loss (lambda*mean(scores^2))",
+    type=float,
+    default=0.0,
+    show_default=True,
+)
 # Misc hyperparameters.
-@click.option('--g-batch-gpu',  help='Limit batch size per GPU for G', metavar='INT',           type=click.IntRange(min=1))
-@click.option('--d-batch-gpu',  help='Limit batch size per GPU for D', metavar='INT',           type=click.IntRange(min=1))
-
+@click.option(
+    "--g-batch-gpu",
+    help="Limit batch size per GPU for G",
+    metavar="INT",
+    type=click.IntRange(min=1),
+)
+@click.option(
+    "--d-batch-gpu",
+    help="Limit batch size per GPU for D",
+    metavar="INT",
+    type=click.IntRange(min=1),
+)
 # Misc settings.
-@click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
-@click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid50k_full', show_default=True)
-@click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=10000000, show_default=True)
-@click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
-@click.option('--snapshot-policy', help='Snapshot retention policy', type=click.Choice(['all', 'latest-best']), default='all', show_default=True)
-@click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
-@click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
-@click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
-
+@click.option(
+    "--desc", help="String to include in result dir name", metavar="STR", type=str
+)
+@click.option(
+    "--metrics",
+    help="Quality metrics",
+    metavar="[NAME|A,B,C|none]",
+    type=parse_comma_separated_list,
+    default="fid50k_full",
+    show_default=True,
+)
+@click.option(
+    "--kimg",
+    help="Total training duration",
+    metavar="KIMG",
+    type=click.IntRange(min=1),
+    default=10000000,
+    show_default=True,
+)
+@click.option(
+    "--tick",
+    help="How often to print progress",
+    metavar="KIMG",
+    type=click.IntRange(min=1),
+    default=4,
+    show_default=True,
+)
+@click.option(
+    "--snap",
+    help="How often to save snapshots",
+    metavar="TICKS",
+    type=click.IntRange(min=1),
+    default=50,
+    show_default=True,
+)
+@click.option(
+    "--snapshot-policy",
+    help="Snapshot retention policy",
+    type=click.Choice(["all", "latest-best"]),
+    default="all",
+    show_default=True,
+)
+@click.option(
+    "--seed",
+    help="Random seed",
+    metavar="INT",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+)
+@click.option(
+    "--nobench",
+    help="Disable cuDNN benchmarking",
+    metavar="BOOL",
+    type=bool,
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--workers",
+    help="DataLoader worker processes",
+    metavar="INT",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+)
+@click.option("-n", "--dry-run", help="Print training options and exit", is_flag=True)
 def main(**kwargs):
     # Initialize config.
-    opts = dnnlib.EasyDict(kwargs) # Command line arguments.
-    c = dnnlib.EasyDict() # Main config dict.
-    
-    c.G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator')
-    c.D_kwargs = dnnlib.EasyDict(class_name='training.networks.Discriminator')
-    
-    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0, 0.0], eps=1e-8)
-    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0, 0.0], eps=1e-8)
-    
-    c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.R3GANLoss')
+    opts = dnnlib.EasyDict(kwargs)  # Command line arguments.
+    c = dnnlib.EasyDict()  # Main config dict.
+
+    c.G_kwargs = dnnlib.EasyDict(class_name="training.networks.Generator")
+    c.D_kwargs = dnnlib.EasyDict(class_name="training.networks.Discriminator")
+
+    c.G_opt_kwargs = dnnlib.EasyDict(
+        class_name="torch.optim.Adam", betas=[0.0, 0.0], eps=1e-8
+    )
+    c.D_opt_kwargs = dnnlib.EasyDict(
+        class_name="torch.optim.Adam", betas=[0.0, 0.0], eps=1e-8
+    )
+
+    c.loss_kwargs = dnnlib.EasyDict(class_name="training.loss.R3GANLoss")
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
 
     # Training set.
     c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
     if opts.cond and not c.training_set_kwargs.use_labels:
-        raise click.ClickException('--cond=True requires labels specified in dataset.json')
+        raise click.ClickException(
+            "--cond=True requires labels specified in dataset.json"
+        )
     c.training_set_kwargs.use_labels = opts.cond
     c.training_set_kwargs.xflip = opts.mirror
 
@@ -227,96 +464,196 @@ def main(**kwargs):
     c.batch_size = opts.batch
     c.g_batch_gpu = opts.g_batch_gpu or opts.batch // opts.gpus
     c.d_batch_gpu = opts.d_batch_gpu or opts.batch // opts.gpus
-    
-    if opts.preset == 'CIFAR10':
+
+    if opts.preset == "CIFAR10":
         WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32]]
         FP16Stages = [-1, -2, -3]
         NoiseDimension = 64
-        
+
         if opts.cond:
             c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
             c.D_kwargs.ConditionEmbeddingDimension = WidthPerStage[0]
-       
+
         ema_nimg = 5000 * 1000
         decay_nimg = 2e7
-       
-        c.ema_scheduler = { 'base_value': 0, 'final_value': ema_nimg, 'total_nimg': decay_nimg }
-        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.55, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 5e-5, 'total_nimg': decay_nimg }
-        c.gamma_scheduler = { 'base_value': 0.05, 'final_value': 0.005, 'total_nimg': decay_nimg }
-        c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
 
-    if opts.preset == 'FFHQ-64':
+        c.ema_scheduler = {
+            "base_value": 0,
+            "final_value": ema_nimg,
+            "total_nimg": decay_nimg,
+        }
+        c.aug_scheduler = {
+            "base_value": 0,
+            "final_value": 0.55,
+            "total_nimg": decay_nimg,
+        }
+        c.lr_scheduler = {
+            "base_value": 2e-4,
+            "final_value": 5e-5,
+            "total_nimg": decay_nimg,
+        }
+        c.gamma_scheduler = {
+            "base_value": 0.05,
+            "final_value": 0.005,
+            "total_nimg": decay_nimg,
+        }
+        c.beta2_scheduler = {
+            "base_value": 0.9,
+            "final_value": 0.99,
+            "total_nimg": decay_nimg,
+        }
+
+    if opts.preset == "FFHQ-64":
         WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024, 512]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32, 16]]
         FP16Stages = [-1, -2, -3, -4]
         NoiseDimension = 64
-       
+
         ema_nimg = 500 * 1000
         decay_nimg = 2e7
-       
-        c.ema_scheduler = { 'base_value': 0, 'final_value': ema_nimg, 'total_nimg': decay_nimg }
-        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 5e-5, 'total_nimg': decay_nimg }
-        c.gamma_scheduler = { 'base_value': 2, 'final_value': 0.2, 'total_nimg': decay_nimg }
-        c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
 
-    if opts.preset == 'FFHQ-256':
+        c.ema_scheduler = {
+            "base_value": 0,
+            "final_value": ema_nimg,
+            "total_nimg": decay_nimg,
+        }
+        c.aug_scheduler = {
+            "base_value": 0,
+            "final_value": 0.3,
+            "total_nimg": decay_nimg,
+        }
+        c.lr_scheduler = {
+            "base_value": 2e-4,
+            "final_value": 5e-5,
+            "total_nimg": decay_nimg,
+        }
+        c.gamma_scheduler = {
+            "base_value": 2,
+            "final_value": 0.2,
+            "total_nimg": decay_nimg,
+        }
+        c.beta2_scheduler = {
+            "base_value": 0.9,
+            "final_value": 0.99,
+            "total_nimg": decay_nimg,
+        }
+
+    if opts.preset == "FFHQ-256":
         WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024, 512, 256, 128]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32, 16, 8, 4]]
         FP16Stages = [-1, -2, -3, -4]
         NoiseDimension = 64
-       
+
         ema_nimg = 500 * 1000
         decay_nimg = 2e7
-       
-        c.ema_scheduler = { 'base_value': 0, 'final_value': ema_nimg, 'total_nimg': decay_nimg }
-        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 5e-5, 'total_nimg': decay_nimg }
-        c.gamma_scheduler = { 'base_value': 150, 'final_value': 15, 'total_nimg': decay_nimg }
-        c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
 
-    if opts.preset == 'ImageNet-32':
+        c.ema_scheduler = {
+            "base_value": 0,
+            "final_value": ema_nimg,
+            "total_nimg": decay_nimg,
+        }
+        c.aug_scheduler = {
+            "base_value": 0,
+            "final_value": 0.3,
+            "total_nimg": decay_nimg,
+        }
+        c.lr_scheduler = {
+            "base_value": 2e-4,
+            "final_value": 5e-5,
+            "total_nimg": decay_nimg,
+        }
+        c.gamma_scheduler = {
+            "base_value": 150,
+            "final_value": 15,
+            "total_nimg": decay_nimg,
+        }
+        c.beta2_scheduler = {
+            "base_value": 0.9,
+            "final_value": 0.99,
+            "total_nimg": decay_nimg,
+        }
+
+    if opts.preset == "ImageNet-32":
         WidthPerStage = [6 * x // 4 for x in [1024, 1024, 1024, 1024]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32]]
         FP16Stages = [-1, -2, -3]
         NoiseDimension = 64
-       
+
         c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
         c.D_kwargs.ConditionEmbeddingDimension = WidthPerStage[0]
-       
+
         ema_nimg = 50000 * 1000
         decay_nimg = 2e8
-       
-        c.ema_scheduler = { 'base_value': 0, 'final_value': ema_nimg, 'total_nimg': decay_nimg }
-        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.5, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 5e-5, 'total_nimg': decay_nimg }
-        c.gamma_scheduler = { 'base_value': 0.5, 'final_value': 0.05, 'total_nimg': decay_nimg }
-        c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
 
-    if opts.preset == 'ImageNet-64':
+        c.ema_scheduler = {
+            "base_value": 0,
+            "final_value": ema_nimg,
+            "total_nimg": decay_nimg,
+        }
+        c.aug_scheduler = {
+            "base_value": 0,
+            "final_value": 0.5,
+            "total_nimg": decay_nimg,
+        }
+        c.lr_scheduler = {
+            "base_value": 2e-4,
+            "final_value": 5e-5,
+            "total_nimg": decay_nimg,
+        }
+        c.gamma_scheduler = {
+            "base_value": 0.5,
+            "final_value": 0.05,
+            "total_nimg": decay_nimg,
+        }
+        c.beta2_scheduler = {
+            "base_value": 0.9,
+            "final_value": 0.99,
+            "total_nimg": decay_nimg,
+        }
+
+    if opts.preset == "ImageNet-64":
         WidthPerStage = [6 * x // 4 for x in [1024, 1024, 1024, 1024, 1024]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32, 32]]
         FP16Stages = [-1, -2, -3, -4]
         NoiseDimension = 64
-        
+
         c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
         c.D_kwargs.ConditionEmbeddingDimension = WidthPerStage[0]
-        
+
         ema_nimg = 50000 * 1000
         decay_nimg = 2e8
-        
-        c.ema_scheduler = { 'base_value': 0, 'final_value': ema_nimg, 'total_nimg': decay_nimg }
-        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.4, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 5e-5, 'total_nimg': decay_nimg }
-        c.gamma_scheduler = { 'base_value': 1, 'final_value': 0.1, 'total_nimg': decay_nimg }
-        c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
+
+        c.ema_scheduler = {
+            "base_value": 0,
+            "final_value": ema_nimg,
+            "total_nimg": decay_nimg,
+        }
+        c.aug_scheduler = {
+            "base_value": 0,
+            "final_value": 0.4,
+            "total_nimg": decay_nimg,
+        }
+        c.lr_scheduler = {
+            "base_value": 2e-4,
+            "final_value": 5e-5,
+            "total_nimg": decay_nimg,
+        }
+        c.gamma_scheduler = {
+            "base_value": 1,
+            "final_value": 0.1,
+            "total_nimg": decay_nimg,
+        }
+        c.beta2_scheduler = {
+            "base_value": 0.9,
+            "final_value": 0.99,
+            "total_nimg": decay_nimg,
+        }
 
     c.G_kwargs.NoiseDimension = NoiseDimension
     c.G_kwargs.WidthPerStage = WidthPerStage
@@ -324,14 +661,13 @@ def main(**kwargs):
     c.G_kwargs.BlocksPerStage = BlocksPerStage
     c.G_kwargs.ExpansionFactor = 2
     c.G_kwargs.FP16Stages = FP16Stages
-    
+
     c.D_kwargs.WidthPerStage = [*reversed(WidthPerStage)]
     c.D_kwargs.CardinalityPerStage = [*reversed(CardinalityPerStage)]
     c.D_kwargs.BlocksPerStage = [*reversed(BlocksPerStage)]
     c.D_kwargs.ExpansionFactor = 2
     c.D_kwargs.FP16Stages = [x + len(FP16Stages) for x in FP16Stages]
-    
-    
+
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
@@ -342,28 +678,52 @@ def main(**kwargs):
 
     # Sanity checks.
     if c.batch_size % c.num_gpus != 0:
-        raise click.ClickException('--batch must be a multiple of --gpus')
-    if c.batch_size % (c.num_gpus * c.g_batch_gpu) != 0 or c.batch_size % (c.num_gpus * c.d_batch_gpu) != 0:
-        raise click.ClickException('--batch must be a multiple of --gpus times --batch-gpu')
+        raise click.ClickException("--batch must be a multiple of --gpus")
+    if (
+        c.batch_size % (c.num_gpus * c.g_batch_gpu) != 0
+        or c.batch_size % (c.num_gpus * c.d_batch_gpu) != 0
+    ):
+        raise click.ClickException(
+            "--batch must be a multiple of --gpus times --batch-gpu"
+        )
     if any(not metric_main.is_valid_metric(metric) for metric in c.metrics):
-        raise click.ClickException('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
+        raise click.ClickException(
+            "\n".join(
+                ["--metrics can only contain the following values:"]
+                + metric_main.list_valid_metrics()
+            )
+        )
     if opts.lambda_rank < 0:
-        raise click.ClickException('--lambda-rank must be non-negative')
+        raise click.ClickException("--lambda-rank must be non-negative")
     if opts.lambda_adv < 0:
-        raise click.ClickException('--lambda-adv must be non-negative')
+        raise click.ClickException("--lambda-adv must be non-negative")
     if opts.adv_margin < 0:
-        raise click.ClickException('--adv-margin must be non-negative')
+        raise click.ClickException("--adv-margin must be non-negative")
     if opts.adv_tau <= 0:
-        raise click.ClickException('--adv-tau must be positive')
+        raise click.ClickException("--adv-tau must be positive")
     if opts.rank_margin <= 0:
-        raise click.ClickException('--rank-margin must be positive')
+        raise click.ClickException("--rank-margin must be positive")
     if opts.rank_score_reg < 0:
-        raise click.ClickException('--rank-score-reg must be non-negative')
+        raise click.ClickException("--rank-score-reg must be non-negative")
 
-            
     # Augmentation.
     if opts.aug:
-        c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=0.5, contrast=0.5, lumaflip=0.5, hue=0.5, saturation=0.5, cutout=1)
+        c.augment_kwargs = dnnlib.EasyDict(
+            class_name="training.augment.AugmentPipe",
+            xflip=1,
+            rotate90=1,
+            xint=1,
+            scale=1,
+            rotate=1,
+            aniso=1,
+            xfrac=1,
+            brightness=0.5,
+            contrast=0.5,
+            lumaflip=0.5,
+            hue=0.5,
+            saturation=0.5,
+            cutout=1,
+        )
 
     # Resume.
     if opts.resume is not None:
@@ -374,7 +734,7 @@ def main(**kwargs):
         c.cudnn_benchmark = False
 
     # Description string.
-    desc = f'{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}'
+    desc = f"{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}"
     c.loss_kwargs.use_r1_penalty = not opts.disable_r1
     c.loss_kwargs.use_r2_penalty = not opts.disable_r2
     c.loss_kwargs.use_non_aug_gp = opts.non_aug_gp
@@ -383,17 +743,20 @@ def main(**kwargs):
     c.loss_kwargs.adv_margin = opts.adv_margin
     c.loss_kwargs.adv_tau = opts.adv_tau
     if opts.disable_r1:
-        desc += '-nor1'
+        desc += "-nor1"
     if opts.disable_r2:
-        desc += '-nor2'
+        desc += "-nor2"
     if opts.non_aug_gp:
-        desc += '-nonauggp'
-    if opts.adv_loss_type == 'infonce':
-        desc += f'-infonce-tau{opts.adv_tau:g}'
+        desc += "-nonauggp"
+    if opts.adv_loss_type == "infonce":
+        desc += f"-infonce-tau{opts.adv_tau:g}"
     elif opts.adv_margin > 0:
-        desc += f'-advm{opts.adv_margin:g}'
+        desc += f"-advm{opts.adv_margin:g}"
     if opts.rank_loss:
-        desc += '-rank'
+        click.echo(
+            "NOTE: --rank-loss is experimental. Prefer --adv-loss-type=infonce or --adv-loss-type=softmargin --adv-margin=1.0"
+        )
+        desc += "-rank"
         c.loss_kwargs.rank_loss = True
         c.loss_kwargs.rank_K = opts.rank_k
         c.loss_kwargs.rank_loss_type = opts.rank_loss_type
@@ -403,18 +766,19 @@ def main(**kwargs):
         c.loss_kwargs.rank_augment = opts.rank_augment
         c.loss_kwargs.rank_margin = opts.rank_margin
         c.loss_kwargs.rank_score_reg = opts.rank_score_reg
-        desc += f'-{opts.rank_loss_type}'
+        desc += f"-{opts.rank_loss_type}"
         if opts.rank_score_reg > 0:
-            desc += f'-scorereg{opts.rank_score_reg:g}'
+            desc += f"-scorereg{opts.rank_score_reg:g}"
     if opts.desc is not None:
-        desc += f'-{opts.desc}'
+        desc += f"-{opts.desc}"
 
     # Launch.
     launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main() # pylint: disable=no-value-for-parameter
+    main()  # pylint: disable=no-value-for-parameter
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
