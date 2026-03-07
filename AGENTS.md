@@ -13,6 +13,10 @@ replacing ad-hoc GAN training tricks. Forked from NVIDIA's StyleGAN3 codebase.
 
 ## Build & Run Commands
 
+```
+conda activate gan
+```
+
 ### Training
 
 ```bash

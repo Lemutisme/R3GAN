@@ -259,7 +259,7 @@ def parse_comma_separated_list(s):
 # Rank loss options.
 @click.option(
     "--rank-loss",
-    help="Enable ranking loss for D",
+    help="Legacy: enable deprecated interpolation path prior for D",
     metavar="BOOL",
     type=bool,
     default=False,
@@ -267,7 +267,7 @@ def parse_comma_separated_list(s):
 )
 @click.option(
     "--rank-k",
-    help="Number of interpolation steps for ranking",
+    help="Legacy: number of interpolation steps for deprecated path prior",
     metavar="INT",
     type=click.IntRange(min=2),
     default=8,
@@ -275,42 +275,42 @@ def parse_comma_separated_list(s):
 )
 @click.option(
     "--rank-loss-type",
-    help="Ranking loss type",
+    help="Legacy: ranking loss type for deprecated path prior",
     type=click.Choice(["listmle", "pairwise_logistic", "pairwise_hinge"]),
     default="listmle",
     show_default=True,
 )
 @click.option(
     "--lambda-rank",
-    help="Weight for ranking loss",
+    help="Legacy: weight for deprecated path prior",
     type=float,
     default=0.1,
     show_default=True,
 )
 @click.option(
     "--lambda-adv",
-    help="Weight for adversarial loss (set 0 for pure rank ablation)",
+    help="Legacy: weight for mapped adversarial loss",
     type=float,
     default=1.0,
     show_default=True,
 )
 @click.option(
     "--adv-loss-type",
-    help="Adversarial loss type",
+    help="Legacy: adversarial loss type mapped to delta-centric pair/list weights",
     type=click.Choice(["softmargin", "infonce"]),
     default="softmargin",
     show_default=True,
 )
 @click.option(
     "--adv-margin",
-    help="Soft-margin for adversarial loss (0 reproduces RpGAN)",
+    help="Legacy: pairwise soft-margin (0 reproduces RpGAN)",
     type=float,
     default=0.0,
     show_default=True,
 )
 @click.option(
     "--adv-tau",
-    help="Temperature for InfoNCE adversarial loss",
+    help="Legacy: temperature for mapped listwise InfoNCE loss",
     type=float,
     default=0.07,
     show_default=True,
@@ -331,7 +331,7 @@ def parse_comma_separated_list(s):
 )
 @click.option(
     "--rank-augment",
-    help="Apply augmentation to rank images",
+    help="Legacy no-op: deprecated rank augmentation flag",
     metavar="BOOL",
     type=bool,
     default=False,
@@ -347,6 +347,107 @@ def parse_comma_separated_list(s):
 @click.option(
     "--rank-score-reg",
     help="Score regularization weight for rank loss (lambda*mean(scores^2))",
+    type=float,
+    default=0.0,
+    show_default=True,
+)
+# Delta-centric RankGAN options.
+@click.option(
+    "--lambda-pair",
+    help="Weight for pairwise delta loss",
+    type=float,
+)
+@click.option(
+    "--pair-margin",
+    help="Soft-margin for pairwise delta loss",
+    type=float,
+)
+@click.option(
+    "--lambda-list",
+    help="Weight for listwise delta loss",
+    type=float,
+)
+@click.option(
+    "--list-loss-type",
+    help="Listwise delta aggregator",
+    type=click.Choice(["infonce"]),
+    default="infonce",
+    show_default=True,
+)
+@click.option(
+    "--list-tau",
+    help="Temperature for listwise InfoNCE delta loss",
+    type=float,
+)
+@click.option(
+    "--lambda-local-rank",
+    help="Weight for semantic-local gap-rank prior on D",
+    type=float,
+    default=0.0,
+    show_default=True,
+)
+@click.option(
+    "--local-rank-k",
+    help="Number of nearest fake neighbors for semantic-local gap-rank prior",
+    metavar="INT",
+    type=click.IntRange(min=2),
+    default=4,
+    show_default=True,
+)
+@click.option(
+    "--path-rank-reg",
+    help="Enable deprecated interpolation-based path prior for D",
+    metavar="BOOL",
+    type=bool,
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--path-rank-k",
+    help="Number of interpolation steps for deprecated path prior",
+    metavar="INT",
+    type=click.IntRange(min=2),
+    default=8,
+    show_default=True,
+)
+@click.option(
+    "--path-rank-loss-type",
+    help="Deprecated path prior loss type",
+    type=click.Choice(["listmle", "pairwise_logistic", "pairwise_hinge"]),
+    default="listmle",
+    show_default=True,
+)
+@click.option(
+    "--lambda-path-rank",
+    help="Weight for deprecated path prior",
+    type=float,
+    default=0.1,
+    show_default=True,
+)
+@click.option(
+    "--path-rank-mode",
+    help="Interpolation mode for deprecated path prior",
+    type=click.Choice(["intrpl", "noise", "add_mix"]),
+    default="intrpl",
+    show_default=True,
+)
+@click.option(
+    "--path-rank-alpha-dist",
+    help="Alpha distribution for deprecated path prior",
+    type=click.Choice(["linear", "cosine", "random"]),
+    default="linear",
+    show_default=True,
+)
+@click.option(
+    "--path-rank-margin",
+    help="Margin for deprecated pairwise hinge path prior",
+    type=float,
+    default=1.0,
+    show_default=True,
+)
+@click.option(
+    "--path-rank-score-reg",
+    help="Score regularization weight for deprecated path prior",
     type=float,
     default=0.0,
     show_default=True,
@@ -705,6 +806,14 @@ def main(**kwargs):
         raise click.ClickException("--rank-margin must be positive")
     if opts.rank_score_reg < 0:
         raise click.ClickException("--rank-score-reg must be non-negative")
+    if opts.lambda_local_rank < 0:
+        raise click.ClickException("--lambda-local-rank must be non-negative")
+    if opts.path_rank_margin <= 0:
+        raise click.ClickException("--path-rank-margin must be positive")
+    if opts.lambda_path_rank < 0:
+        raise click.ClickException("--lambda-path-rank must be non-negative")
+    if opts.path_rank_score_reg < 0:
+        raise click.ClickException("--path-rank-score-reg must be non-negative")
 
     # Augmentation.
     if opts.aug:
@@ -738,37 +847,130 @@ def main(**kwargs):
     c.loss_kwargs.use_r1_penalty = not opts.disable_r1
     c.loss_kwargs.use_r2_penalty = not opts.disable_r2
     c.loss_kwargs.use_non_aug_gp = opts.non_aug_gp
-    c.loss_kwargs.lambda_adv = opts.lambda_adv
-    c.loss_kwargs.adv_loss_type = opts.adv_loss_type
-    c.loss_kwargs.adv_margin = opts.adv_margin
-    c.loss_kwargs.adv_tau = opts.adv_tau
+
+    using_new_main = any(
+        value is not None
+        for value in [opts.lambda_pair, opts.pair_margin, opts.lambda_list, opts.list_tau]
+    ) or opts.list_loss_type != "infonce"
+    if using_new_main:
+        lambda_pair = 1.0 if opts.lambda_pair is None else opts.lambda_pair
+        pair_margin = 0.0 if opts.pair_margin is None else opts.pair_margin
+        lambda_list = 0.0 if opts.lambda_list is None else opts.lambda_list
+        list_tau = 0.07 if opts.list_tau is None else opts.list_tau
+        if (
+            opts.lambda_adv != 1.0
+            or opts.adv_loss_type != "softmargin"
+            or opts.adv_margin != 0.0
+            or opts.adv_tau != 0.07
+        ):
+            click.echo(
+                "NOTE: legacy --adv-* options are ignored because delta-centric pair/list options were provided."
+            )
+    else:
+        lambda_pair = opts.lambda_adv if opts.adv_loss_type == "softmargin" else 0.0
+        pair_margin = opts.adv_margin
+        lambda_list = opts.lambda_adv if opts.adv_loss_type == "infonce" else 0.0
+        list_tau = opts.adv_tau
+
+    if lambda_pair < 0:
+        raise click.ClickException("--lambda-pair must be non-negative")
+    if pair_margin < 0:
+        raise click.ClickException("--pair-margin must be non-negative")
+    if lambda_list < 0:
+        raise click.ClickException("--lambda-list must be non-negative")
+    if list_tau <= 0:
+        raise click.ClickException("--list-tau must be positive")
+
+    legacy_rank_used = (
+        opts.rank_loss
+        or opts.rank_k != 8
+        or opts.rank_loss_type != "listmle"
+        or opts.lambda_rank != 0.1
+        or opts.rank_mode != "intrpl"
+        or opts.rank_alpha_dist != "linear"
+        or opts.rank_augment
+        or opts.rank_margin != 1.0
+        or opts.rank_score_reg != 0.0
+    )
+    using_new_path = (
+        opts.path_rank_reg
+        or opts.path_rank_k != 8
+        or opts.path_rank_loss_type != "listmle"
+        or opts.lambda_path_rank != 0.1
+        or opts.path_rank_mode != "intrpl"
+        or opts.path_rank_alpha_dist != "linear"
+        or opts.path_rank_margin != 1.0
+        or opts.path_rank_score_reg != 0.0
+    )
+    if using_new_path:
+        path_rank_reg = opts.path_rank_reg
+        path_rank_k = opts.path_rank_k
+        path_rank_loss_type = opts.path_rank_loss_type
+        lambda_path_rank = opts.lambda_path_rank
+        path_rank_mode = opts.path_rank_mode
+        path_rank_alpha_dist = opts.path_rank_alpha_dist
+        path_rank_margin = opts.path_rank_margin
+        path_rank_score_reg = opts.path_rank_score_reg
+        if legacy_rank_used:
+            click.echo(
+                "NOTE: legacy --rank-* options are ignored because --path-rank-* options were provided."
+            )
+    else:
+        path_rank_reg = opts.rank_loss
+        path_rank_k = opts.rank_k
+        path_rank_loss_type = opts.rank_loss_type
+        lambda_path_rank = opts.lambda_rank
+        path_rank_mode = opts.rank_mode
+        path_rank_alpha_dist = opts.rank_alpha_dist
+        path_rank_margin = opts.rank_margin
+        path_rank_score_reg = opts.rank_score_reg
+        if legacy_rank_used:
+            click.echo(
+                "NOTE: legacy --rank-* options are deprecated; use --path-rank-* instead."
+            )
+    if opts.rank_augment:
+        click.echo(
+            "NOTE: --rank-augment is deprecated and ignored; path rank regularization always uses non-augmented views."
+        )
+
+    c.loss_kwargs.lambda_pair = lambda_pair
+    c.loss_kwargs.pair_margin = pair_margin
+    c.loss_kwargs.lambda_list = lambda_list
+    c.loss_kwargs.list_loss_type = opts.list_loss_type
+    c.loss_kwargs.list_tau = list_tau
+    c.loss_kwargs.lambda_local_rank = opts.lambda_local_rank
+    c.loss_kwargs.local_rank_k = opts.local_rank_k
+    c.loss_kwargs.path_rank_reg = path_rank_reg
+    c.loss_kwargs.path_rank_k = path_rank_k
+    c.loss_kwargs.path_rank_loss_type = path_rank_loss_type
+    c.loss_kwargs.lambda_path_rank = lambda_path_rank
+    c.loss_kwargs.path_rank_mode = path_rank_mode
+    c.loss_kwargs.path_rank_alpha_dist = path_rank_alpha_dist
+    c.loss_kwargs.path_rank_margin = path_rank_margin
+    c.loss_kwargs.path_rank_score_reg = path_rank_score_reg
+
     if opts.disable_r1:
         desc += "-nor1"
     if opts.disable_r2:
         desc += "-nor2"
     if opts.non_aug_gp:
         desc += "-nonauggp"
-    if opts.adv_loss_type == "infonce":
-        desc += f"-infonce-tau{opts.adv_tau:g}"
-    elif opts.adv_margin > 0:
-        desc += f"-advm{opts.adv_margin:g}"
-    if opts.rank_loss:
+
+    if lambda_pair > 0:
+        desc += f"-pair{lambda_pair:g}"
+        if pair_margin > 0:
+            desc += f"m{pair_margin:g}"
+    if lambda_list > 0:
+        desc += f"-{opts.list_loss_type}-tau{list_tau:g}"
+    if opts.lambda_local_rank > 0:
+        desc += f"-localrank{opts.lambda_local_rank:g}-k{opts.local_rank_k:d}"
+    if path_rank_reg:
         click.echo(
-            "NOTE: --rank-loss is experimental. Prefer --adv-loss-type=infonce or --adv-loss-type=softmargin --adv-margin=1.0"
+            "NOTE: path rank regularization is a deprecated interpolation-based prior; the main RankGAN game is delta-centric."
         )
-        desc += "-rank"
-        c.loss_kwargs.rank_loss = True
-        c.loss_kwargs.rank_K = opts.rank_k
-        c.loss_kwargs.rank_loss_type = opts.rank_loss_type
-        c.loss_kwargs.lambda_rank = opts.lambda_rank
-        c.loss_kwargs.rank_mode = opts.rank_mode
-        c.loss_kwargs.rank_alpha_dist = opts.rank_alpha_dist
-        c.loss_kwargs.rank_augment = opts.rank_augment
-        c.loss_kwargs.rank_margin = opts.rank_margin
-        c.loss_kwargs.rank_score_reg = opts.rank_score_reg
-        desc += f"-{opts.rank_loss_type}"
-        if opts.rank_score_reg > 0:
-            desc += f"-scorereg{opts.rank_score_reg:g}"
+        desc += f"-pathrank-{path_rank_loss_type}"
+        if path_rank_score_reg > 0:
+            desc += f"-scorereg{path_rank_score_reg:g}"
     if opts.desc is not None:
         desc += f"-{opts.desc}"
 

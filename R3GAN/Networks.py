@@ -162,12 +162,22 @@ class Discriminator(nn.Module):
         if ConditionDimension is not None:
             self.EmbeddingLayer = MSRInitializer(nn.Linear(ConditionDimension, ConditionEmbeddingDimension, bias=False), ActivationGain=1 / math.sqrt(ConditionEmbeddingDimension))
         
-    def forward(self, x, y=None):
+    def forward(self, x, y=None, return_features=False):
         x = self.ExtractionLayer(x.to(self.MainLayers[0].DataType))
-        
-        for Layer in self.MainLayers:
+
+        Features = None
+        FeatureStageIndex = len(self.MainLayers) - 2
+        for Index, Layer in enumerate(self.MainLayers):
             x = Layer(x)
-        
+
+            if return_features and Index == FeatureStageIndex:
+                Features = x.to(torch.float32).reshape(x.shape[0], x.shape[1], -1).mean(dim=2)
+
         x = (x * self.EmbeddingLayer(y)).sum(dim=1, keepdim=True) if hasattr(self, 'EmbeddingLayer') else x
-        
-        return x.view(x.shape[0])
+
+        Scores = x.view(x.shape[0])
+        if return_features:
+            if Features is None:
+                Features = Scores.to(torch.float32).unsqueeze(1)
+            return Scores, Features
+        return Scores

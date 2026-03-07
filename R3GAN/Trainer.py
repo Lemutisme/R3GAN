@@ -21,12 +21,17 @@ class AdversarialTraining:
         return Gradient.square().sum([1, 2, 3])
 
     @staticmethod
+    def _pairwise_delta(RealLogits, FakeLogits):
+        return RealLogits - FakeLogits
+
+    @staticmethod
     def _generator_adv_loss(
         FakeLogits, RealLogits, LossType="softmargin", Margin=0.0, Tau=0.07
     ):
+        Delta = AdversarialTraining._pairwise_delta(RealLogits, FakeLogits)
         if LossType == "softmargin":
-            RelativisticLogits = FakeLogits - RealLogits
-            AdversarialLoss = nn.functional.softplus(Margin - RelativisticLogits)
+            RelativisticLogits = -Delta
+            AdversarialLoss = nn.functional.softplus(Margin + Delta)
             return AdversarialLoss, RelativisticLogits
 
         if LossType == "infonce":
@@ -45,9 +50,10 @@ class AdversarialTraining:
     def _discriminator_adv_loss(
         RealLogits, FakeLogits, LossType="softmargin", Margin=0.0, Tau=0.07
     ):
+        Delta = AdversarialTraining._pairwise_delta(RealLogits, FakeLogits)
         if LossType == "softmargin":
-            RelativisticLogits = RealLogits - FakeLogits
-            AdversarialLoss = nn.functional.softplus(Margin - RelativisticLogits)
+            RelativisticLogits = Delta
+            AdversarialLoss = nn.functional.softplus(Margin - Delta)
             return AdversarialLoss, RelativisticLogits
 
         if LossType == "infonce":

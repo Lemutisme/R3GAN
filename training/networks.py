@@ -43,5 +43,5 @@ class Discriminator(nn.Module):
         for x in kw['FP16Stages']:
             self.Model.MainLayers[x].DataType = torch.bfloat16
         
-    def forward(self, x, c):
-        return self.Model(x, c)
+    def forward(self, x, c, return_features=False):
+        return self.Model(x, c, return_features=return_features)

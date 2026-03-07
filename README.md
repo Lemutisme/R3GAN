@@ -36,9 +36,21 @@ To reproduce the main results from our paper, run the following commands:
 # CIFAR10
 python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=2 --batch=512 --mirror=1 --aug=1 --cond=1 --preset=CIFAR10 --tick=1 --snap=200
 
-# CIFAR10 RANK
+# CIFAR10 RankGAN-v1 (pairwise delta core + R1/R2)
 python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=2 --batch=512 --mirror=1 --aug=1 --cond=1 --preset=CIFAR10 --tick=1 --snap=200 \
-	--rank-loss=1 --rank-loss-type=listmle --lambda-rank=0.1 --lambda-adv=1.0 --rank-k=3
+	--lambda-pair=1.0 --pair-margin=0.0
+
+# CIFAR10 RankGAN-v2 (pairwise core + listwise Delta-matrix InfoNCE)
+python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=2 --batch=512 --mirror=1 --aug=1 --cond=1 --preset=CIFAR10 --tick=1 --snap=200 \
+	--lambda-pair=1.0 --lambda-list=1.0 --list-tau=0.07
+
+# CIFAR10 RankGAN-v3 (add semantic-local gap-rank prior)
+python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=2 --batch=512 --mirror=1 --aug=1 --cond=1 --preset=CIFAR10 --tick=1 --snap=200 \
+	--lambda-pair=1.0 --lambda-list=1.0 --list-tau=0.07 --lambda-local-rank=0.1 --local-rank-k=4
+
+# Deprecated: interpolation-based path prior
+python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=2 --batch=512 --mirror=1 --aug=1 --cond=1 --preset=CIFAR10 --tick=1 --snap=200 \
+	--path-rank-reg=1 --path-rank-loss-type=listmle --lambda-path-rank=0.1 --path-rank-k=3
 
 # FFHQ 64x64
 python train.py --outdir=./training-runs --data=./datasets/ffhq-64x64.zip --gpus=8 --batch=256 --mirror=1 --aug=1 --preset=FFHQ-64 --tick=1 --snap=200
@@ -52,6 +64,13 @@ python train.py --outdir=./training-runs --data=./datasets/imagenet-32x32.zip --
 # Imagenet 64x64
 python train.py --outdir=./training-runs --data=./datasets/imagenet-64x64.zip --gpus=64 --batch=4096 --mirror=1 --aug=1 --cond=1 --preset=ImageNet-64 --tick=1 --snap=200
 ```
+
+The delta-centric RankGAN variants are organized as:
+
+- **RankGAN-v1**: pairwise relativistic delta game (`--lambda-pair`).
+- **RankGAN-v2**: pairwise core + listwise Delta-matrix InfoNCE (`--lambda-list`).
+- **RankGAN-v3**: v1/v2 plus semantic-local gap-rank prior on D (`--lambda-local-rank`).
+- **Deprecated path prior**: interpolation-based auxiliary regularizer (`--path-rank-reg`).
 
 The easiest way to explore different training settings is to modify [`train.py`](./train.py) directly.
 
