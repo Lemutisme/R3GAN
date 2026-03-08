@@ -1025,6 +1025,79 @@ class TestLocalCoupling(unittest.TestCase):
         self.assertTrue((d_loss >= 0).all())
         self.assertTrue((g_loss >= 0).all())
 
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_coupled_d_grads_match_autograd(self):
+        from training.loss import (
+            local_coupled_discriminator_loss_with_grads,
+            build_local_coupling, local_delta,
+            local_pairwise_discriminator_loss, local_listwise_discriminator_loss,
+        )
+        torch.manual_seed(42)
+        real_scores = torch.randn(6, requires_grad=True)
+        fake_scores = torch.randn(4, requires_grad=True)
+        real_feat = torch.randn(6, 8)
+        fake_feat = torch.randn(4, 8)
+        indices, weights = build_local_coupling(real_feat, fake_feat, k=3)
+
+        # Autograd reference
+        delta = local_delta(real_scores, fake_scores, indices)
+        loss = (
+            1.0 * local_pairwise_discriminator_loss(delta, weights, margin=0.5).mean()
+            + 0.5 * local_listwise_discriminator_loss(delta, weights, tau=0.1).mean()
+        )
+        grad_real_ref, grad_fake_ref = torch.autograd.grad(loss, [real_scores, fake_scores])
+
+        # Function under test
+        _, _, grad_real, grad_fake = local_coupled_discriminator_loss_with_grads(
+            real_scores.detach(), fake_scores.detach(), indices, weights,
+            lambda_pair=1.0, pair_margin=0.5, lambda_list=0.5, list_tau=0.1,
+        )
+        self.assertTrue(torch.allclose(grad_real, grad_real_ref.detach(), atol=1e-5))
+        self.assertTrue(torch.allclose(grad_fake, grad_fake_ref.detach(), atol=1e-5))
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_coupled_g_grads_match_autograd(self):
+        from training.loss import (
+            local_coupled_generator_loss_with_grads,
+            build_local_coupling, local_delta,
+            local_pairwise_generator_loss, local_listwise_generator_loss,
+        )
+        torch.manual_seed(42)
+        real_scores = torch.randn(6)
+        fake_scores = torch.randn(4, requires_grad=True)
+        real_feat = torch.randn(6, 8)
+        fake_feat = torch.randn(4, 8)
+        indices, weights = build_local_coupling(real_feat, fake_feat, k=3)
+
+        delta = local_delta(real_scores, fake_scores, indices)
+        loss = (
+            1.0 * local_pairwise_generator_loss(delta, weights, margin=0.5).mean()
+            + 0.5 * local_listwise_generator_loss(delta, weights, tau=0.1).mean()
+        )
+        (grad_fake_ref,) = torch.autograd.grad(loss, [fake_scores])
+
+        _, _, grad_fake = local_coupled_generator_loss_with_grads(
+            real_scores.detach(), fake_scores.detach(), indices, weights,
+            lambda_pair=1.0, pair_margin=0.5, lambda_list=0.5, list_tau=0.1,
+        )
+        self.assertTrue(torch.allclose(grad_fake, grad_fake_ref.detach(), atol=1e-5))
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_coupled_pairwise_only_d(self):
+        from training.loss import local_coupled_discriminator_loss_with_grads, build_local_coupling
+        torch.manual_seed(42)
+        real_feat = torch.randn(4, 8)
+        fake_feat = torch.randn(3, 8)
+        indices, weights = build_local_coupling(real_feat, fake_feat, k=2)
+        loss_val, loss_vec, grad_real, grad_fake = local_coupled_discriminator_loss_with_grads(
+            torch.randn(4), torch.randn(3), indices, weights,
+            lambda_pair=1.0, pair_margin=0.0, lambda_list=0.0, list_tau=0.07,
+        )
+        self.assertGreater(loss_val.item(), 0)
+        self.assertEqual(loss_vec.shape, (3,))
+        self.assertEqual(grad_real.shape, (4,))
+        self.assertEqual(grad_fake.shape, (3,))
+
 
 if __name__ == "__main__":
     unittest.main()

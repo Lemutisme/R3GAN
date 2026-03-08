@@ -229,6 +229,50 @@ def local_listwise_generator_loss(
     return max_val.squeeze(1) + torch.log(stable_sum)
 
 
+def local_coupled_discriminator_loss_with_grads(
+    real_scores, fake_scores, neighbor_indices, coupling_weights,
+    lambda_pair, pair_margin, lambda_list, list_tau,
+):
+    """Return (loss_scalar, loss_vector, grad_real, grad_fake) for local-coupled D loss."""
+    real_var = real_scores.detach().to(torch.float32).requires_grad_(True)
+    fake_var = fake_scores.detach().to(torch.float32).requires_grad_(True)
+    delta = local_delta(real_var, fake_var, neighbor_indices)
+    loss_terms = torch.zeros(fake_var.shape[0], device=fake_var.device)
+    if lambda_pair > 0:
+        loss_terms = loss_terms + lambda_pair * local_pairwise_discriminator_loss(
+            delta, coupling_weights, margin=pair_margin
+        )
+    if lambda_list > 0:
+        loss_terms = loss_terms + lambda_list * local_listwise_discriminator_loss(
+            delta, coupling_weights, tau=list_tau
+        )
+    loss_value = loss_terms.mean()
+    grad_real, grad_fake = torch.autograd.grad(loss_value, [real_var, fake_var])
+    return loss_value.detach(), loss_terms.detach(), grad_real.detach(), grad_fake.detach()
+
+
+def local_coupled_generator_loss_with_grads(
+    real_scores, fake_scores, neighbor_indices, coupling_weights,
+    lambda_pair, pair_margin, lambda_list, list_tau,
+):
+    """Return (loss_scalar, loss_vector, grad_fake) for local-coupled G loss."""
+    real_var = real_scores.detach().to(torch.float32)
+    fake_var = fake_scores.detach().to(torch.float32).requires_grad_(True)
+    delta = local_delta(real_var, fake_var, neighbor_indices)
+    loss_terms = torch.zeros(fake_var.shape[0], device=fake_var.device)
+    if lambda_pair > 0:
+        loss_terms = loss_terms + lambda_pair * local_pairwise_generator_loss(
+            delta, coupling_weights, margin=pair_margin
+        )
+    if lambda_list > 0:
+        loss_terms = loss_terms + lambda_list * local_listwise_generator_loss(
+            delta, coupling_weights, tau=list_tau
+        )
+    loss_value = loss_terms.mean()
+    (grad_fake,) = torch.autograd.grad(loss_value, [fake_var])
+    return loss_value.detach(), loss_terms.detach(), grad_fake.detach()
+
+
 # ----------------------------------------------------------------------------
 
 
