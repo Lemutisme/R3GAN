@@ -922,6 +922,46 @@ class TestLocalCoupling(unittest.TestCase):
         indices, weights = build_local_coupling(real_feat, fake_feat, k=2)
         self.assertFalse(weights.requires_grad, 'Coupling weights must not track gradients')
 
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_pairwise_d_loss_correct_ordering_low(self):
+        from training.loss import local_delta, local_pairwise_discriminator_loss
+        real_scores = torch.tensor([5.0, 4.0])
+        fake_scores = torch.tensor([0.0])
+        indices = torch.tensor([[0, 1]])
+        weights = torch.tensor([[0.6, 0.4]])
+        delta = local_delta(real_scores, fake_scores, indices)
+        loss = local_pairwise_discriminator_loss(delta, weights, margin=0.0)
+        self.assertEqual(loss.shape, (1,))
+        self.assertGreater(loss.item(), 0)  # softplus always > 0 but small for correct ordering
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_pairwise_g_loss_mirror(self):
+        from training.loss import local_delta, local_pairwise_discriminator_loss, local_pairwise_generator_loss
+        real_scores = torch.tensor([2.0, 3.0])
+        fake_scores = torch.tensor([1.0, 2.5])
+        indices = torch.tensor([[0, 1], [1, 0]])
+        weights = torch.tensor([[0.5, 0.5], [0.7, 0.3]])
+        delta = local_delta(real_scores, fake_scores, indices)
+        d_loss = local_pairwise_discriminator_loss(delta, weights, margin=0.0)
+        g_loss = local_pairwise_generator_loss(delta, weights, margin=0.0)
+        self.assertEqual(d_loss.shape, (2,))
+        self.assertEqual(g_loss.shape, (2,))
+        # Both should be finite
+        self.assertTrue(torch.isfinite(d_loss).all())
+        self.assertTrue(torch.isfinite(g_loss).all())
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_pairwise_margin_increases_loss(self):
+        from training.loss import local_delta, local_pairwise_discriminator_loss
+        real_scores = torch.tensor([3.0, 4.0])
+        fake_scores = torch.tensor([1.0])
+        indices = torch.tensor([[0, 1]])
+        weights = torch.tensor([[0.5, 0.5]])
+        delta = local_delta(real_scores, fake_scores, indices)
+        loss_m0 = local_pairwise_discriminator_loss(delta, weights, margin=0.0)
+        loss_m2 = local_pairwise_discriminator_loss(delta, weights, margin=2.0)
+        self.assertGreater(loss_m2.item(), loss_m0.item())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -179,6 +179,24 @@ def local_delta(
     return real_scores[neighbor_indices] - fake_scores.unsqueeze(1)
 
 
+def local_pairwise_discriminator_loss(
+    delta: torch.Tensor,
+    coupling_weights: torch.Tensor,
+    margin: float = 0.0,
+) -> torch.Tensor:
+    """Coupling-weighted pairwise D loss. Returns [B_f] per-fake losses."""
+    return (coupling_weights * F.softplus(margin - delta)).sum(dim=1)
+
+
+def local_pairwise_generator_loss(
+    delta: torch.Tensor,
+    coupling_weights: torch.Tensor,
+    margin: float = 0.0,
+) -> torch.Tensor:
+    """Coupling-weighted pairwise G loss. Returns [B_f] per-fake losses."""
+    return (coupling_weights * F.softplus(margin + delta)).sum(dim=1)
+
+
 # ----------------------------------------------------------------------------
 
 
