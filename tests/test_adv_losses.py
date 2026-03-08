@@ -1,3 +1,4 @@
+import copy
 import unittest
 import warnings
 from unittest import mock
@@ -19,9 +20,14 @@ if torch is not None:
     from training.loss import (
         R3GANLoss,
         allpairs_delta,
+        build_local_coupling,
         infonce_discriminator_loss,
+        infonce_discriminator_loss_with_grads,
         infonce_generator_loss,
+        infonce_generator_loss_with_grads,
         listmle_loss,
+        local_delta,
+        local_rank_loss_with_grads,
         make_rank_list,
         pairwise_delta,
         pairwise_discriminator_loss,
@@ -239,11 +245,91 @@ class TestListwiseLosses(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
+class TestCoupledLossHelpers(unittest.TestCase):
+    def test_infonce_discriminator_grad_coefficients_match_autograd(self):
+        real = torch.randn(5)
+        fake = torch.randn(5)
+        tau = 0.19
+        loss_value, loss_vector, grad_real, grad_fake = infonce_discriminator_loss_with_grads(
+            real, fake, tau=tau
+        )
+
+        real_var = real.detach().clone().requires_grad_(True)
+        fake_var = fake.detach().clone().requires_grad_(True)
+        direct_loss = infonce_discriminator_loss(allpairs_delta(real_var, fake_var), tau=tau).mean()
+        direct_loss.backward()
+
+        self.assertTrue(torch.allclose(loss_value, direct_loss.detach(), atol=1e-6))
+        self.assertTrue(
+            torch.allclose(
+                loss_vector,
+                infonce_discriminator_loss(allpairs_delta(real, fake), tau=tau),
+                atol=1e-6,
+            )
+        )
+        self.assertTrue(torch.allclose(grad_real, real_var.grad, atol=1e-6))
+        self.assertTrue(torch.allclose(grad_fake, fake_var.grad, atol=1e-6))
+
+    def test_local_rank_grad_coefficients_match_autograd(self):
+        real_features = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.8, 0.2]])
+        fake_features = torch.tensor([[0.9, 0.1], [0.6, 0.4], [0.1, 0.9]])
+        fake_scores = torch.tensor([2.0, 1.5, 0.5])
+        class_ids = torch.tensor([0, 0, 1])
+
+        loss_value, adjacent_losses, grad_fake = local_rank_loss_with_grads(
+            real_features=real_features,
+            fake_features=fake_features,
+            fake_scores=fake_scores,
+            class_ids=class_ids,
+            k=2,
+        )
+
+        score_var = fake_scores.detach().clone().requires_grad_(True)
+        direct_loss = R3GANLoss(
+            G=TinyG(),
+            D=TinyFeatureD(),
+            lambda_pair=0.0,
+            lambda_list=0.0,
+            lambda_local_rank=1.0,
+            local_rank_k=2,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )._compute_local_rank_loss(
+            real_scores=torch.zeros_like(score_var),
+            fake_scores=score_var,
+            real_features=real_features,
+            fake_features=fake_features,
+            real_c=F.one_hot(class_ids, num_classes=2).to(torch.float32),
+        )
+        direct_loss.backward()
+
+        self.assertGreater(adjacent_losses.numel(), 0)
+        self.assertTrue(torch.allclose(loss_value, direct_loss.detach(), atol=1e-6))
+        self.assertTrue(torch.allclose(grad_fake, score_var.grad, atol=1e-6))
+
+
+@unittest.skipIf(torch is None, "PyTorch is not available in this environment")
 class TestR3GANLossBuffering(unittest.TestCase):
     def _make_loss(self, **kwargs):
         g = TinyG()
         d = kwargs.pop("D", TinyFeatureD())
         return R3GANLoss(G=g, D=d, **kwargs)
+
+    def _set_phase_requires_grad(self, loss_obj, phase):
+        loss_obj.G.requires_grad_(phase == "G")
+        loss_obj.D.requires_grad_(phase == "D")
+
+    def _grads(self, module):
+        return [None if p.grad is None else p.grad.detach().clone() for p in module.parameters()]
+
+    def _assert_grad_lists_close(self, got, expected, atol=1e-6):
+        self.assertEqual(len(got), len(expected))
+        for grad_got, grad_expected in zip(got, expected):
+            if grad_expected is None:
+                self.assertIsNone(grad_got)
+            else:
+                self.assertIsNotNone(grad_got)
+                self.assertTrue(torch.allclose(grad_got, grad_expected, atol=atol))
 
     def test_finalize_noop_for_pairwise(self):
         loss_obj = self._make_loss(lambda_pair=1.0, lambda_list=0.0)
@@ -263,6 +349,120 @@ class TestR3GANLossBuffering(unittest.TestCase):
         loss_obj.finalize_accumulation()
         has_grad = any(p.grad is not None for p in loss_obj.D.parameters())
         self.assertTrue(has_grad)
+
+    def test_local_rank_only_does_not_buffer_generator_phase(self):
+        loss_obj = self._make_loss(
+            lambda_pair=1.0,
+            lambda_list=0.0,
+            lambda_local_rank=1.0,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        self._set_phase_requires_grad(loss_obj, "G")
+        real = torch.randn(2, 3, 4, 4)
+        cond = torch.zeros(2, 0)
+        noise = torch.randn(2, 4)
+        loss_obj.accumulate_gradients("G", real, cond, noise, gamma=0.1, gain=1.0)
+        self.assertIsNone(loss_obj._coupled_phase_buffer)
+        self.assertTrue(any(p.grad is not None for p in loss_obj.G.parameters()))
+
+    def test_listwise_replay_matches_full_batch_generator_gradients(self):
+        torch.manual_seed(3)
+        base_g = TinyG()
+        base_d = TinyFeatureD()
+        replay_loss = R3GANLoss(
+            G=copy.deepcopy(base_g),
+            D=copy.deepcopy(base_d),
+            lambda_pair=1.0,
+            lambda_list=1.0,
+            list_tau=0.11,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        direct_loss = R3GANLoss(
+            G=copy.deepcopy(base_g),
+            D=copy.deepcopy(base_d),
+            lambda_pair=1.0,
+            lambda_list=1.0,
+            list_tau=0.11,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        self._set_phase_requires_grad(replay_loss, "G")
+        self._set_phase_requires_grad(direct_loss, "G")
+
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+
+        fake = direct_loss.G(noise, cond)
+        real_scores = direct_loss.run_D(real.detach(), cond, augment=True)
+        fake_scores = direct_loss.run_D(fake, cond, augment=True)
+        pair_term = pairwise_generator_loss(
+            pairwise_delta(real_scores, fake_scores), margin=direct_loss.pair_margin
+        ).mean()
+        list_term = infonce_generator_loss(
+            allpairs_delta(real_scores, fake_scores), tau=direct_loss.list_tau
+        ).mean()
+        (pair_term + list_term).backward()
+        expected_grads = self._grads(direct_loss.G)
+
+        replay_loss.accumulate_gradients("G", real[:2], cond[:2], noise[:2], gamma=0.1, gain=0.5)
+        replay_loss.accumulate_gradients("G", real[2:], cond[2:], noise[2:], gamma=0.1, gain=0.5)
+        replay_loss.finalize_accumulation()
+        replay_grads = self._grads(replay_loss.G)
+
+        self._assert_grad_lists_close(replay_grads, expected_grads)
+        self.assertTrue(all(p.grad is None for p in replay_loss.D.parameters()))
+
+    def test_listwise_replay_matches_full_batch_discriminator_gradients(self):
+        torch.manual_seed(7)
+        base_g = TinyG()
+        base_d = TinyFeatureD()
+        replay_loss = R3GANLoss(
+            G=copy.deepcopy(base_g),
+            D=copy.deepcopy(base_d),
+            lambda_pair=1.0,
+            lambda_list=1.0,
+            list_tau=0.23,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        direct_loss = R3GANLoss(
+            G=copy.deepcopy(base_g),
+            D=copy.deepcopy(base_d),
+            lambda_pair=1.0,
+            lambda_list=1.0,
+            list_tau=0.23,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        self._set_phase_requires_grad(replay_loss, "D")
+        self._set_phase_requires_grad(direct_loss, "D")
+
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+
+        fake = direct_loss.G(noise, cond).detach()
+        real_scores = direct_loss.run_D(real, cond, augment=True)
+        fake_scores = direct_loss.run_D(fake, cond, augment=True)
+        pair_term = pairwise_discriminator_loss(
+            pairwise_delta(real_scores, fake_scores), margin=direct_loss.pair_margin
+        ).mean()
+        list_term = infonce_discriminator_loss(
+            allpairs_delta(real_scores, fake_scores), tau=direct_loss.list_tau
+        ).mean()
+        (pair_term + list_term).backward()
+        expected_grads = self._grads(direct_loss.D)
+
+        replay_loss.accumulate_gradients("D", real[:2], cond[:2], noise[:2], gamma=0.1, gain=0.5)
+        replay_loss.accumulate_gradients("D", real[2:], cond[2:], noise[2:], gamma=0.1, gain=0.5)
+        replay_loss.finalize_accumulation()
+        replay_grads = self._grads(replay_loss.D)
+
+        self._assert_grad_lists_close(replay_grads, expected_grads)
+        self.assertTrue(all(p.grad is None for p in replay_loss.G.parameters()))
 
 
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
@@ -339,7 +539,7 @@ class TestLocalRankPrior(unittest.TestCase):
         loss_1.backward()
         self.assertIsNone(real_features.grad)
         self.assertIsNone(fake_features.grad)
-        self.assertIsNotNone(real_scores.grad)
+        self.assertIsNone(real_scores.grad)
         self.assertIsNotNone(fake_scores.grad)
 
     def test_local_rank_class_masking_skips_cross_class_neighbors(self):
@@ -387,6 +587,120 @@ class TestLocalRankPrior(unittest.TestCase):
         loss_obj.finalize_accumulation()
         self.assertTrue(any(p.grad is not None for p in loss_obj.D.parameters()))
         self.assertTrue(all(p.grad is None for p in loss_obj.G.parameters()))
+
+    def test_local_rank_replay_matches_full_batch_gradients(self):
+        torch.manual_seed(11)
+        base_g = TinyG()
+        base_d = TinyFeatureD()
+        replay_loss = R3GANLoss(
+            G=copy.deepcopy(base_g),
+            D=copy.deepcopy(base_d),
+            lambda_pair=0.0,
+            lambda_list=0.0,
+            lambda_local_rank=1.0,
+            local_rank_k=3,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        direct_loss = R3GANLoss(
+            G=copy.deepcopy(base_g),
+            D=copy.deepcopy(base_d),
+            lambda_pair=0.0,
+            lambda_list=0.0,
+            lambda_local_rank=1.0,
+            local_rank_k=3,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        replay_loss.G.requires_grad_(False)
+        replay_loss.D.requires_grad_(True)
+        direct_loss.G.requires_grad_(False)
+        direct_loss.D.requires_grad_(True)
+
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+
+        fake = direct_loss.G(noise, cond).detach()
+        _, real_features = direct_loss.run_D(real, cond, augment=False, return_features=True)
+        clean_fake_scores, fake_features = direct_loss.run_D(
+            fake, cond, augment=False, return_features=True
+        )
+        local_rank_loss = direct_loss._compute_local_rank_loss(
+            real_scores=torch.zeros_like(clean_fake_scores),
+            fake_scores=clean_fake_scores,
+            real_features=real_features,
+            fake_features=fake_features,
+            real_c=cond,
+        )
+        local_rank_loss.backward()
+        expected_grads = [
+            None if p.grad is None else p.grad.detach().clone() for p in direct_loss.D.parameters()
+        ]
+
+        replay_loss.accumulate_gradients("D", real[:2], cond[:2], noise[:2], gamma=0.1, gain=0.5)
+        replay_loss.accumulate_gradients("D", real[2:], cond[2:], noise[2:], gamma=0.1, gain=0.5)
+        replay_loss.finalize_accumulation()
+        replay_grads = [
+            None if p.grad is None else p.grad.detach().clone() for p in replay_loss.D.parameters()
+        ]
+
+        self.assertEqual(len(replay_grads), len(expected_grads))
+        for grad_replay, grad_expected in zip(replay_grads, expected_grads):
+            if grad_expected is None:
+                self.assertIsNone(grad_replay)
+            else:
+                self.assertTrue(torch.allclose(grad_replay, grad_expected, atol=1e-6))
+
+    def test_local_rank_replay_ignores_augmentation(self):
+        torch.manual_seed(13)
+        base_g = TinyG()
+        base_d = TinyFeatureD()
+        loss_plain = R3GANLoss(
+            G=copy.deepcopy(base_g),
+            D=copy.deepcopy(base_d),
+            lambda_pair=0.0,
+            lambda_list=0.0,
+            lambda_local_rank=1.0,
+            local_rank_k=2,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+            augment_pipe=None,
+        )
+        loss_aug = R3GANLoss(
+            G=copy.deepcopy(base_g),
+            D=copy.deepcopy(base_d),
+            lambda_pair=0.0,
+            lambda_list=0.0,
+            lambda_local_rank=1.0,
+            local_rank_k=2,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+            augment_pipe=OffsetAugment(5.0),
+        )
+        loss_plain.G.requires_grad_(False)
+        loss_plain.D.requires_grad_(True)
+        loss_aug.G.requires_grad_(False)
+        loss_aug.D.requires_grad_(True)
+
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+
+        loss_plain.accumulate_gradients("D", real[:2], cond[:2], noise[:2], gamma=0.1, gain=0.5)
+        loss_plain.accumulate_gradients("D", real[2:], cond[2:], noise[2:], gamma=0.1, gain=0.5)
+        loss_plain.finalize_accumulation()
+
+        loss_aug.accumulate_gradients("D", real[:2], cond[:2], noise[:2], gamma=0.1, gain=0.5)
+        loss_aug.accumulate_gradients("D", real[2:], cond[2:], noise[2:], gamma=0.1, gain=0.5)
+        loss_aug.finalize_accumulation()
+
+        for param_plain, param_aug in zip(loss_plain.D.parameters(), loss_aug.D.parameters()):
+            if param_plain.grad is None or param_aug.grad is None:
+                self.assertIsNone(param_plain.grad)
+                self.assertIsNone(param_aug.grad)
+            else:
+                self.assertTrue(torch.allclose(param_plain.grad, param_aug.grad, atol=1e-6))
 
 
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
@@ -460,6 +774,48 @@ class TestPathRankingLosses(unittest.TestCase):
 
 
 @unittest.skipIf(
+    torch is None,
+    "PyTorch is not available in this environment",
+)
+class TestStatsSemantics(unittest.TestCase):
+    def test_score_stats_report_raw_scores_and_delta(self):
+        loss_obj = R3GANLoss(
+            G=TinyG(),
+            D=TinyD(),
+            lambda_pair=1.0,
+            lambda_list=0.0,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        loss_obj.G.requires_grad_(False)
+        loss_obj.D.requires_grad_(True)
+        real = torch.randn(2, 3, 4, 4)
+        cond = torch.zeros(2, 0)
+        noise = torch.randn(2, 4)
+
+        with torch.no_grad():
+            fake = loss_obj.G(noise, cond).detach()
+            expected_real_scores = loss_obj.run_D(real, cond, augment=True)
+            expected_fake_scores = loss_obj.run_D(fake, cond, augment=True)
+            expected_delta = pairwise_delta(expected_real_scores, expected_fake_scores)
+
+        reports = {}
+
+        def _capture(name, value):
+            if torch.is_tensor(value):
+                reports[name] = value.detach().clone()
+            else:
+                reports[name] = torch.as_tensor(value)
+
+        with mock.patch("training.loss.training_stats.report", side_effect=_capture):
+            loss_obj.accumulate_gradients("D", real, cond, noise, gamma=0.1, gain=1.0)
+
+        self.assertTrue(torch.allclose(reports["Loss/scores/real"], expected_real_scores))
+        self.assertTrue(torch.allclose(reports["Loss/scores/fake"], expected_fake_scores))
+        self.assertTrue(torch.allclose(reports["Loss/delta/pair"], expected_delta))
+
+
+@unittest.skipIf(
     torch is None or CliRunner is None or dnnlib is None,
     "Test dependencies are not available in this environment",
 )
@@ -516,6 +872,55 @@ class TestCliMappings(unittest.TestCase):
         self.assertEqual(loss_kwargs.path_rank_k, 3)
         self.assertIn("deprecated; use --path-rank-* instead", result.output)
         self.assertIn("deprecated and ignored", result.output)
+
+
+class TestLocalCoupling(unittest.TestCase):
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_build_local_coupling_shapes(self):
+        from training.loss import build_local_coupling
+        real_feat = torch.randn(8, 16)
+        fake_feat = torch.randn(4, 16)
+        indices, weights = build_local_coupling(real_feat, fake_feat, k=3)
+        self.assertEqual(indices.shape, (4, 3))
+        self.assertEqual(weights.shape, (4, 3))
+        self.assertTrue((indices >= 0).all() and (indices < 8).all())
+        self.assertTrue(torch.allclose(weights.sum(dim=1), torch.ones(4), atol=1e-5))
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_build_local_coupling_k_clamped_to_num_reals(self):
+        from training.loss import build_local_coupling
+        real_feat = torch.randn(2, 8)
+        fake_feat = torch.randn(5, 8)
+        indices, weights = build_local_coupling(real_feat, fake_feat, k=10)
+        self.assertEqual(indices.shape[1], 2)  # clamped to num reals
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_build_local_coupling_nearest_neighbor_is_first(self):
+        from training.loss import build_local_coupling
+        real_feat = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+        fake_feat = torch.tensor([[0.9, 0.1]])  # closest to real[0]
+        indices, weights = build_local_coupling(real_feat, fake_feat, k=2)
+        self.assertEqual(indices[0, 0].item(), 0)  # nearest = real[0]
+        self.assertGreater(weights[0, 0].item(), weights[0, 1].item())
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_delta_values(self):
+        from training.loss import local_delta
+        real_scores = torch.tensor([3.0, 1.0, 5.0])
+        fake_scores = torch.tensor([2.0, 4.0])
+        neighbor_indices = torch.tensor([[0, 2], [1, 0]])
+        delta = local_delta(real_scores, fake_scores, neighbor_indices)
+        expected = torch.tensor([[3.0 - 2.0, 5.0 - 2.0], [1.0 - 4.0, 3.0 - 4.0]])
+        self.assertTrue(torch.allclose(delta, expected))
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_build_local_coupling_no_feature_gradients(self):
+        from training.loss import build_local_coupling
+        real_feat = torch.randn(4, 8, requires_grad=True)
+        fake_feat = torch.randn(3, 8, requires_grad=True)
+        indices, weights = build_local_coupling(real_feat, fake_feat, k=2)
+        self.assertFalse(weights.requires_grad, 'Coupling weights must not track gradients')
 
 
 if __name__ == "__main__":
