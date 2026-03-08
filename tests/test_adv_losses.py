@@ -962,6 +962,69 @@ class TestLocalCoupling(unittest.TestCase):
         loss_m2 = local_pairwise_discriminator_loss(delta, weights, margin=2.0)
         self.assertGreater(loss_m2.item(), loss_m0.item())
 
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_listwise_d_loss_correct_ordering_low(self):
+        from training.loss import local_delta, local_listwise_discriminator_loss
+        real_scores = torch.tensor([10.0, 8.0])
+        fake_scores = torch.tensor([0.0])
+        indices = torch.tensor([[0, 1]])
+        weights = torch.tensor([[0.5, 0.5]])
+        delta = local_delta(real_scores, fake_scores, indices)
+        loss = local_listwise_discriminator_loss(delta, weights, tau=0.1)
+        self.assertEqual(loss.shape, (1,))
+        self.assertLess(loss.item(), 0.01)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_listwise_wrong_ordering_high(self):
+        from training.loss import local_delta, local_listwise_discriminator_loss
+        real_scores = torch.tensor([0.0, -1.0])
+        fake_scores = torch.tensor([5.0])
+        indices = torch.tensor([[0, 1]])
+        weights = torch.tensor([[0.5, 0.5]])
+        delta = local_delta(real_scores, fake_scores, indices)
+        loss = local_listwise_discriminator_loss(delta, weights, tau=0.1)
+        self.assertGreater(loss.item(), 1.0)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_listwise_numerical_stability(self):
+        from training.loss import local_delta, local_listwise_discriminator_loss, local_listwise_generator_loss
+        real_scores = torch.tensor([-100.0, -200.0])
+        fake_scores = torch.tensor([100.0])
+        indices = torch.tensor([[0, 1]])
+        weights = torch.tensor([[0.5, 0.5]])
+        delta = local_delta(real_scores, fake_scores, indices)
+        d_loss = local_listwise_discriminator_loss(delta, weights, tau=0.01)
+        g_loss = local_listwise_generator_loss(delta, weights, tau=0.01)
+        self.assertTrue(torch.isfinite(d_loss).all(), 'D loss must be finite with extreme values')
+        self.assertTrue(torch.isfinite(g_loss).all(), 'G loss must be finite with extreme values')
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_listwise_tau_validation(self):
+        from training.loss import local_listwise_discriminator_loss
+        delta = torch.tensor([[1.0, 2.0]])
+        weights = torch.tensor([[0.5, 0.5]])
+        with self.assertRaises(ValueError):
+            local_listwise_discriminator_loss(delta, weights, tau=0.0)
+        with self.assertRaises(ValueError):
+            local_listwise_discriminator_loss(delta, weights, tau=-1.0)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_local_listwise_g_loss_symmetric_to_d(self):
+        from training.loss import local_delta, local_listwise_discriminator_loss, local_listwise_generator_loss
+        torch.manual_seed(42)
+        real_scores = torch.randn(4)
+        fake_scores = torch.randn(3)
+        indices = torch.tensor([[0, 1], [2, 3], [1, 2]])
+        weights = torch.tensor([[0.6, 0.4], [0.5, 0.5], [0.7, 0.3]])
+        delta = local_delta(real_scores, fake_scores, indices)
+        d_loss = local_listwise_discriminator_loss(delta, weights, tau=0.1)
+        g_loss = local_listwise_generator_loss(delta, weights, tau=0.1)
+        # Both should be finite and non-negative (log(1 + positive) >= 0)
+        self.assertTrue(torch.isfinite(d_loss).all())
+        self.assertTrue(torch.isfinite(g_loss).all())
+        self.assertTrue((d_loss >= 0).all())
+        self.assertTrue((g_loss >= 0).all())
+
 
 if __name__ == "__main__":
     unittest.main()

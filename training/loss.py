@@ -197,6 +197,38 @@ def local_pairwise_generator_loss(
     return (coupling_weights * F.softplus(margin + delta)).sum(dim=1)
 
 
+def local_listwise_discriminator_loss(
+    delta: torch.Tensor,
+    coupling_weights: torch.Tensor,
+    tau: float = 0.07,
+) -> torch.Tensor:
+    """Local-coupled listwise D loss: log(1 + Σ π̃_ij exp(-Δ_ij/τ)). Returns [B_f]."""
+    if tau <= 0:
+        raise ValueError(f"Temperature must be positive, got {tau}")
+    neg_scaled = -delta / tau
+    max_val = neg_scaled.detach().max(dim=1, keepdim=True).values.clamp(min=0)
+    stable_sum = torch.exp(-max_val.squeeze(1)) + (
+        coupling_weights * torch.exp(neg_scaled - max_val)
+    ).sum(dim=1)
+    return max_val.squeeze(1) + torch.log(stable_sum)
+
+
+def local_listwise_generator_loss(
+    delta: torch.Tensor,
+    coupling_weights: torch.Tensor,
+    tau: float = 0.07,
+) -> torch.Tensor:
+    """Local-coupled listwise G loss: log(1 + Σ π̃_ij exp(+Δ_ij/τ)). Returns [B_f]."""
+    if tau <= 0:
+        raise ValueError(f"Temperature must be positive, got {tau}")
+    pos_scaled = delta / tau
+    max_val = pos_scaled.detach().max(dim=1, keepdim=True).values.clamp(min=0)
+    stable_sum = torch.exp(-max_val.squeeze(1)) + (
+        coupling_weights * torch.exp(pos_scaled - max_val)
+    ).sum(dim=1)
+    return max_val.squeeze(1) + torch.log(stable_sum)
+
+
 # ----------------------------------------------------------------------------
 
 
