@@ -1099,5 +1099,90 @@ class TestLocalCoupling(unittest.TestCase):
         self.assertEqual(grad_fake.shape, (3,))
 
 
+class TestLocalCoupledR3GANLoss(unittest.TestCase):
+    """Tests for R3GANLoss with local coupling."""
+
+    def _make_loss(self, **kwargs):
+        from training.loss import R3GANLoss
+
+        class TinyG(torch.nn.Module):
+            def __init__(self):
+                super(TinyG, self).__init__()
+                self.fc = torch.nn.Linear(4, 3 * 4 * 4)
+            def forward(self, z, c):
+                return self.fc(z).reshape(z.shape[0], 3, 4, 4)
+
+        class TinyFeatureD(torch.nn.Module):
+            def __init__(self):
+                super(TinyFeatureD, self).__init__()
+                self.feat = torch.nn.Linear(3 * 4 * 4, 8)
+                self.head = torch.nn.Linear(8, 1)
+            def forward(self, x, c, return_features=False):
+                f = self.feat(x.reshape(x.shape[0], -1))
+                s = self.head(f).squeeze(-1)
+                if return_features:
+                    return s, f
+                return s
+
+        defaults = dict(G=TinyG(), D=TinyFeatureD(), lambda_pair=1.0)
+        defaults.update(kwargs)
+        return R3GANLoss(**defaults)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_coupling_k_zero_is_backward_compatible(self):
+        loss = self._make_loss(coupling_k=0)
+        self.assertEqual(loss.coupling_k, 0)
+        self.assertFalse(loss._requires_coupling())
+        # With no coupling and pairwise only, should not require full batch
+        self.assertFalse(loss._requires_full_batch('D'))
+        self.assertFalse(loss._requires_full_batch('G'))
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_coupling_k_positive_enables_coupling(self):
+        loss = self._make_loss(coupling_k=4)
+        self.assertEqual(loss.coupling_k, 4)
+        self.assertTrue(loss._requires_coupling())
+        # Coupling always requires full batch
+        self.assertTrue(loss._requires_full_batch('D'))
+        self.assertTrue(loss._requires_full_batch('G'))
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_asymmetric_list_weights(self):
+        loss = self._make_loss(lambda_list_d=1.0, lambda_list_g=0.1, coupling_k=4)
+        self.assertEqual(loss.lambda_list_d, 1.0)
+        self.assertEqual(loss.lambda_list_g, 0.1)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_lambda_list_maps_to_symmetric(self):
+        loss = self._make_loss(lambda_list=0.5)
+        self.assertEqual(loss.lambda_list_d, 0.5)
+        self.assertEqual(loss.lambda_list_g, 0.5)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_lambda_list_d_only_defaults_g_to_zero(self):
+        loss = self._make_loss(lambda_list_d=0.8)
+        self.assertEqual(loss.lambda_list_d, 0.8)
+        self.assertEqual(loss.lambda_list_g, 0.0)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_set_list_weights(self):
+        loss = self._make_loss(lambda_list_d=0.5, lambda_list_g=0.1)
+        loss.set_list_weights(lambda_list_d=0.8, lambda_list_g=0.2)
+        self.assertEqual(loss.lambda_list_d, 0.8)
+        self.assertEqual(loss.lambda_list_g, 0.2)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_set_list_weights_partial(self):
+        loss = self._make_loss(lambda_list_d=0.5, lambda_list_g=0.1)
+        loss.set_list_weights(lambda_list_d=0.9)
+        self.assertEqual(loss.lambda_list_d, 0.9)
+        self.assertEqual(loss.lambda_list_g, 0.1)  # unchanged
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_coupling_k_negative_raises(self):
+        with self.assertRaises(ValueError):
+            self._make_loss(coupling_k=-1)
+
+
 if __name__ == "__main__":
     unittest.main()

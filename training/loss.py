@@ -378,6 +378,9 @@ class R3GANLoss:
         list_tau=None,
         lambda_local_rank=0.0,
         local_rank_k=4,
+        coupling_k=0,            # 0 = no coupling (backward compat); >0 = kNN coupling
+        lambda_list_d=None,      # D-side listwise weight (overrides lambda_list for D)
+        lambda_list_g=None,      # G-side listwise weight (overrides lambda_list for G)
         path_rank_reg=False,
         path_rank_k=8,
         path_rank_loss_type="listmle",
@@ -438,6 +441,14 @@ class R3GANLoss:
         self.lambda_local_rank = float(lambda_local_rank)
         self.local_rank_k = int(local_rank_k)
 
+        self.coupling_k = int(coupling_k)
+        if lambda_list_d is not None or lambda_list_g is not None:
+            self.lambda_list_d = float(lambda_list_d if lambda_list_d is not None else self.lambda_list)
+            self.lambda_list_g = float(lambda_list_g if lambda_list_g is not None else 0.0)
+        else:
+            self.lambda_list_d = self.lambda_list
+            self.lambda_list_g = self.lambda_list
+
         using_new_path = (
             path_rank_reg
             or path_rank_k != 8
@@ -489,6 +500,12 @@ class R3GANLoss:
             raise ValueError("path_rank_margin must be positive")
         if self.path_rank_score_reg < 0:
             raise ValueError("path_rank_score_reg must be non-negative")
+        if self.coupling_k < 0:
+            raise ValueError("coupling_k must be non-negative")
+        if self.lambda_list_d < 0:
+            raise ValueError("lambda_list_d must be non-negative")
+        if self.lambda_list_g < 0:
+            raise ValueError("lambda_list_g must be non-negative")
 
         if rank_augment:
             warnings.warn(
@@ -498,12 +515,24 @@ class R3GANLoss:
 
         self._coupled_phase_buffer = None
 
+    def _requires_coupling(self):
+        return self.coupling_k > 0
+
     def _requires_full_batch(self, phase=None):
+        if self._requires_coupling():
+            return True  # coupling needs full-batch features
         if phase == "G":
             return self.lambda_list > 0
         if phase == "D":
             return self.lambda_list > 0 or self.lambda_local_rank > 0
         return self.lambda_list > 0 or self.lambda_local_rank > 0
+
+    def set_list_weights(self, lambda_list_d=None, lambda_list_g=None):
+        """Update listwise weights (called by training loop scheduler)."""
+        if lambda_list_d is not None:
+            self.lambda_list_d = float(lambda_list_d)
+        if lambda_list_g is not None:
+            self.lambda_list_g = float(lambda_list_g)
 
     def _as_scores(self, logits):
         return self.trainer._as_vector(logits)
