@@ -749,7 +749,8 @@ class R3GANLoss:
                     self.run_D(fake_img, real_c, augment=True).to(torch.float32)
                 )
 
-                if phase == "D" and self.lambda_local_rank > 0:
+                need_clean_features = (phase == "D" and self.lambda_local_rank > 0) or self._requires_coupling()
+                if need_clean_features:
                     _, real_features = self.run_D(
                         real_img.detach(), real_c, augment=False, return_features=True
                     )
@@ -765,7 +766,8 @@ class R3GANLoss:
 
         local["aug_real_scores"] = torch.cat(local["aug_real_scores"], dim=0)
         local["aug_fake_scores"] = torch.cat(local["aug_fake_scores"], dim=0)
-        if phase == "D" and self.lambda_local_rank > 0:
+        need_clean_features = (phase == "D" and self.lambda_local_rank > 0) or self._requires_coupling()
+        if need_clean_features:
             local["clean_real_features"] = torch.cat(local["clean_real_features"], dim=0)
             local["clean_fake_features"] = torch.cat(local["clean_fake_features"], dim=0)
             local["clean_fake_scores"] = torch.cat(local["clean_fake_scores"], dim=0)
@@ -812,8 +814,28 @@ class R3GANLoss:
             grad_fake_clean=None,
         )
 
+        coupling = None
+        if self._requires_coupling():
+            coupling = build_local_coupling(
+                global_meta["clean_real_features"],
+                global_meta["clean_fake_features"],
+                k=self.coupling_k,
+            )
+
         paired_delta = pairwise_delta(local["aug_real_scores"], local["aug_fake_scores"])
         if phase == "G":
+            if self._requires_coupling():
+                neighbor_indices, coupling_weights = coupling
+                _, loss_vector, grad_fake = local_coupled_generator_loss_with_grads(
+                    global_meta["aug_real_scores"],
+                    global_meta["aug_fake_scores"],
+                    neighbor_indices, coupling_weights,
+                    lambda_pair=self.lambda_pair, pair_margin=self.pair_margin,
+                    lambda_list=self.lambda_list_g, list_tau=self.list_tau,
+                )
+                replay["pair_loss"] = loss_vector[local_slice]
+                replay["grad_fake_aug"] = grad_fake[local_slice]
+                return replay
             replay["pair_loss"] = (
                 pairwise_generator_loss(paired_delta, margin=self.pair_margin)
                 if self.lambda_pair > 0
@@ -830,26 +852,40 @@ class R3GANLoss:
                 replay["grad_fake_aug"] = grad_fake[local_slice]
             return replay
 
-        replay["pair_loss"] = (
-            pairwise_discriminator_loss(paired_delta, margin=self.pair_margin)
-            if self.lambda_pair > 0
-            else zero_vector
-        )
-        if self.lambda_list > 0:
-            (
-                list_loss_value,
-                global_list_loss,
-                grad_real,
-                grad_fake,
-            ) = infonce_discriminator_loss_with_grads(
+        if self._requires_coupling():
+            neighbor_indices, coupling_weights = coupling
+            _, loss_vector, grad_real, grad_fake = local_coupled_discriminator_loss_with_grads(
                 global_meta["aug_real_scores"],
                 global_meta["aug_fake_scores"],
-                tau=self.list_tau,
+                neighbor_indices, coupling_weights,
+                lambda_pair=self.lambda_pair, pair_margin=self.pair_margin,
+                lambda_list=self.lambda_list_d, list_tau=self.list_tau,
             )
-            replay["list_loss"] = global_list_loss[local_slice]
-            replay["list_loss_value"] = list_loss_value
+            replay["pair_loss"] = loss_vector[local_slice]
             replay["grad_real_aug"] = grad_real[local_slice]
             replay["grad_fake_aug"] = grad_fake[local_slice]
+            # local_rank computed separately if enabled (existing code still runs below)
+        else:
+            replay["pair_loss"] = (
+                pairwise_discriminator_loss(paired_delta, margin=self.pair_margin)
+                if self.lambda_pair > 0
+                else zero_vector
+            )
+            if self.lambda_list > 0:
+                (
+                    list_loss_value,
+                    global_list_loss,
+                    grad_real,
+                    grad_fake,
+                ) = infonce_discriminator_loss_with_grads(
+                    global_meta["aug_real_scores"],
+                    global_meta["aug_fake_scores"],
+                    tau=self.list_tau,
+                )
+                replay["list_loss"] = global_list_loss[local_slice]
+                replay["list_loss_value"] = list_loss_value
+                replay["grad_real_aug"] = grad_real[local_slice]
+                replay["grad_fake_aug"] = grad_fake[local_slice]
         if self.lambda_local_rank > 0:
             (
                 local_rank_loss,
@@ -943,14 +979,14 @@ class R3GANLoss:
                 real_scores = self.run_D(real_img.detach(), real_c, augment=True)
                 fake_scores = self.run_D(fake_img, real_c, augment=True)
                 scalar_loss = None
-                if self.lambda_pair > 0:
+                if not self._requires_coupling() and self.lambda_pair > 0:
                     pair_loss = pairwise_generator_loss(
                         pairwise_delta(real_scores, fake_scores), margin=self.pair_margin
                     ).mean()
                     scalar_loss = gain * self.lambda_pair * pair_loss
                 if scalar_loss is not None:
-                    scalar_loss.backward(retain_graph=self.lambda_list > 0)
-                if self.lambda_list > 0:
+                    scalar_loss.backward(retain_graph=self.lambda_list > 0 or self._requires_coupling())
+                if self._requires_coupling() or self.lambda_list > 0:
                     grad_fake = replay["grad_fake_aug"][offset : offset + batch_size].to(
                         fake_scores.dtype
                     )
@@ -968,7 +1004,7 @@ class R3GANLoss:
             clean_fake_scores = None
 
             scalar_terms = []
-            if self.lambda_pair > 0:
+            if not self._requires_coupling() and self.lambda_pair > 0:
                 pair_loss = pairwise_discriminator_loss(
                     pairwise_delta(real_scores, fake_scores), margin=self.pair_margin
                 ).mean()
@@ -1018,12 +1054,12 @@ class R3GANLoss:
             if len(scalar_terms) > 0:
                 scalar_loss = gain * torch.stack(scalar_terms).sum()
                 scalar_loss.backward(
-                    retain_graph=self.lambda_list > 0 or self.lambda_local_rank > 0
+                    retain_graph=self.lambda_list > 0 or self.lambda_local_rank > 0 or self._requires_coupling()
                 )
 
             replay_tensors = []
             replay_grads = []
-            if self.lambda_list > 0:
+            if self._requires_coupling() or self.lambda_list > 0:
                 replay_tensors.extend([real_scores, fake_scores])
                 replay_grads.extend(
                     [

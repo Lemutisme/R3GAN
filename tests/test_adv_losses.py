@@ -1183,6 +1183,122 @@ class TestLocalCoupledR3GANLoss(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._make_loss(coupling_k=-1)
 
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_coupling_buffers_d_phase(self):
+        """With coupling_k > 0, D phase should buffer and produce gradients."""
+        loss = self._make_loss(coupling_k=2, lambda_pair=1.0)
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+        loss.accumulate_gradients('D', real, cond, noise, gamma=0.1, gain=1.0)
+        self.assertIsNotNone(loss._coupled_phase_buffer)
+        loss.finalize_accumulation()
+        has_grad = any(p.grad is not None for p in loss.D.parameters())
+        self.assertTrue(has_grad, 'D should have gradients after coupled finalize')
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_coupling_buffers_g_phase(self):
+        """With coupling_k > 0, G phase should buffer and produce gradients."""
+        loss = self._make_loss(coupling_k=2, lambda_pair=1.0, lambda_list_g=0.3)
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+        loss.accumulate_gradients('G', real, cond, noise, gamma=0.1, gain=1.0)
+        self.assertIsNotNone(loss._coupled_phase_buffer)
+        loss.finalize_accumulation()
+        has_grad = any(p.grad is not None for p in loss.G.parameters())
+        self.assertTrue(has_grad, 'G should have gradients after coupled finalize')
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_coupled_replay_matches_full_batch_d_gradients(self):
+        """Buffered coupled replay should produce same D param gradients as single full batch."""
+        torch.manual_seed(42)
+        loss_ref = self._make_loss(coupling_k=2, lambda_pair=1.0, lambda_list_d=0.5)
+        loss_buf = self._make_loss(coupling_k=2, lambda_pair=1.0, lambda_list_d=0.5)
+        loss_buf.G.load_state_dict(loss_ref.G.state_dict())
+        loss_buf.D.load_state_dict(loss_ref.D.state_dict())
+
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+
+        # Reference: single full batch
+        torch.manual_seed(99)
+        loss_ref.accumulate_gradients('D', real, cond, noise, gamma=0.1, gain=1.0)
+        loss_ref.finalize_accumulation()
+        ref_grads = {n: p.grad.clone() for n, p in loss_ref.D.named_parameters() if p.grad is not None}
+
+        # Buffered: two micro-batches
+        loss_buf.D.zero_grad()
+        loss_buf.G.zero_grad()
+        torch.manual_seed(99)
+        loss_buf.accumulate_gradients('D', real[:2], cond[:2], noise[:2], gamma=0.1, gain=0.5)
+        loss_buf.accumulate_gradients('D', real[2:], cond[2:], noise[2:], gamma=0.1, gain=0.5)
+        loss_buf.finalize_accumulation()
+        buf_grads = {n: p.grad.clone() for n, p in loss_buf.D.named_parameters() if p.grad is not None}
+
+        for name in ref_grads:
+            self.assertTrue(
+                torch.allclose(ref_grads[name], buf_grads[name], atol=1e-4),
+                f'D grad mismatch for {name}: max diff = {(ref_grads[name] - buf_grads[name]).abs().max().item():.6f}',
+            )
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_coupled_replay_matches_full_batch_g_gradients(self):
+        """Buffered coupled replay should produce same G param gradients as single full batch."""
+        torch.manual_seed(42)
+        loss_ref = self._make_loss(coupling_k=2, lambda_pair=1.0, lambda_list_g=0.3)
+        loss_buf = self._make_loss(coupling_k=2, lambda_pair=1.0, lambda_list_g=0.3)
+        loss_buf.G.load_state_dict(loss_ref.G.state_dict())
+        loss_buf.D.load_state_dict(loss_ref.D.state_dict())
+
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+
+        torch.manual_seed(99)
+        loss_ref.accumulate_gradients('G', real, cond, noise, gamma=0.1, gain=1.0)
+        loss_ref.finalize_accumulation()
+        ref_grads = {n: p.grad.clone() for n, p in loss_ref.G.named_parameters() if p.grad is not None}
+
+        loss_buf.G.zero_grad()
+        loss_buf.D.zero_grad()
+        torch.manual_seed(99)
+        loss_buf.accumulate_gradients('G', real[:2], cond[:2], noise[:2], gamma=0.1, gain=0.5)
+        loss_buf.accumulate_gradients('G', real[2:], cond[2:], noise[2:], gamma=0.1, gain=0.5)
+        loss_buf.finalize_accumulation()
+        buf_grads = {n: p.grad.clone() for n, p in loss_buf.G.named_parameters() if p.grad is not None}
+
+        for name in ref_grads:
+            self.assertTrue(
+                torch.allclose(ref_grads[name], buf_grads[name], atol=1e-4),
+                f'G grad mismatch for {name}',
+            )
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_pairwise_only_coupling_produces_d_gradients(self):
+        """Coupling with lambda_list_d=0 (pairwise only) should still produce D gradients."""
+        loss = self._make_loss(coupling_k=2, lambda_pair=1.0, lambda_list_d=0.0, lambda_list_g=0.0)
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+        loss.accumulate_gradients('D', real, cond, noise, gamma=0.1, gain=1.0)
+        loss.finalize_accumulation()
+        has_grad = any(p.grad is not None for p in loss.D.parameters())
+        self.assertTrue(has_grad)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_existing_noncoupled_listwise_still_works(self):
+        """With coupling_k=0 and lambda_list > 0, existing global InfoNCE should still work."""
+        loss = self._make_loss(coupling_k=0, lambda_pair=0.0, lambda_list=1.0, list_tau=0.1)
+        real = torch.randn(4, 3, 4, 4)
+        cond = torch.zeros(4, 0)
+        noise = torch.randn(4, 4)
+        loss.accumulate_gradients('D', real, cond, noise, gamma=0.1, gain=1.0)
+        loss.finalize_accumulation()
+        has_grad = any(p.grad is not None for p in loss.D.parameters())
+        self.assertTrue(has_grad)
+
 
 if __name__ == "__main__":
     unittest.main()
