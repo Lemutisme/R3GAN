@@ -165,6 +165,8 @@ def training_loop(
     d_batch_gpu=4,  # Number of samples processed at a time by one GPU.
     ema_scheduler=None,
     aug_scheduler=None,
+    list_d_scheduler          = None,
+    list_g_scheduler          = None,
     total_kimg=25000,  # Total length of the training, measured in thousands of real images.
     kimg_per_tick=4,  # Progress snapshot interval.
     image_snapshot_ticks=50,  # How often to save image snapshots? None = disable.
@@ -419,6 +421,13 @@ def training_loop(
         cur_gamma = cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
         cur_ema_nimg = cosine_decay_with_warmup(cur_nimg, **ema_scheduler)
         cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
+
+        if list_d_scheduler is not None:
+            cur_list_d = cosine_decay_with_warmup(cur_nimg, **list_d_scheduler)
+            loss.set_list_weights(lambda_list_d=cur_list_d)
+        if list_g_scheduler is not None:
+            cur_list_g = cosine_decay_with_warmup(cur_nimg, **list_g_scheduler)
+            loss.set_list_weights(lambda_list_g=cur_list_g)
 
         if augment_pipe is not None:
             augment_pipe.p.copy_(misc.constant(cur_aug_p, device=device))

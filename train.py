@@ -394,6 +394,9 @@ def parse_comma_separated_list(s):
     default=4,
     show_default=True,
 )
+@click.option("--coupling-k",      help="kNN coupling neighbors (0=no coupling, backward compat)",    metavar="INT",   type=int,   default=0,    show_default=True)
+@click.option("--lambda-list-d",   help="D-side local-listwise weight (overrides --lambda-list for D)", metavar="FLOAT", type=float, default=None)
+@click.option("--lambda-list-g",   help="G-side local-listwise weight (overrides --lambda-list for G)", metavar="FLOAT", type=float, default=None)
 @click.option(
     "--path-rank-reg",
     help="Enable deprecated interpolation-based path prior for D",
@@ -769,6 +772,22 @@ def main(**kwargs):
     c.D_kwargs.ExpansionFactor = 2
     c.D_kwargs.FP16Stages = [x + len(FP16Stages) for x in FP16Stages]
 
+    # Coupling-aware listwise curriculum (only when --coupling-k > 0)
+    if opts.coupling_k > 0:
+        total_nimg = c.lr_scheduler['total_nimg']
+        list_d_target = opts.lambda_list_d if opts.lambda_list_d is not None else 0.0
+        list_g_target = opts.lambda_list_g if opts.lambda_list_g is not None else 0.0
+        if list_d_target > 0:
+            c.list_d_scheduler = dict(
+                base_value=list_d_target, total_nimg=total_nimg, final_value=list_d_target,
+                warmup_value=0.0, warmup_nimg=total_nimg // 4,
+            )
+        if list_g_target > 0:
+            c.list_g_scheduler = dict(
+                base_value=list_g_target, total_nimg=total_nimg, final_value=list_g_target,
+                warmup_value=0.0, warmup_nimg=total_nimg // 2,
+            )
+
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
@@ -808,6 +827,10 @@ def main(**kwargs):
         raise click.ClickException("--rank-score-reg must be non-negative")
     if opts.lambda_local_rank < 0:
         raise click.ClickException("--lambda-local-rank must be non-negative")
+    if opts.coupling_k < 0:
+        raise click.ClickException('--coupling-k must be non-negative')
+    if opts.coupling_k > 0 and opts.lambda_pair is not None and opts.lambda_pair <= 0 and (opts.lambda_list_d is None or opts.lambda_list_d <= 0) and (opts.lambda_list_g is None or opts.lambda_list_g <= 0):
+        click.echo('WARNING: coupling_k > 0 but no pairwise or listwise loss enabled')
     if opts.path_rank_margin <= 0:
         raise click.ClickException("--path-rank-margin must be positive")
     if opts.lambda_path_rank < 0:
@@ -948,6 +971,11 @@ def main(**kwargs):
     c.loss_kwargs.path_rank_alpha_dist = path_rank_alpha_dist
     c.loss_kwargs.path_rank_margin = path_rank_margin
     c.loss_kwargs.path_rank_score_reg = path_rank_score_reg
+    c.loss_kwargs.coupling_k = opts.coupling_k
+    if opts.lambda_list_d is not None:
+        c.loss_kwargs.lambda_list_d = opts.lambda_list_d
+    if opts.lambda_list_g is not None:
+        c.loss_kwargs.lambda_list_g = opts.lambda_list_g
 
     if opts.disable_r1:
         desc += "-nor1"
@@ -962,6 +990,12 @@ def main(**kwargs):
             desc += f"m{pair_margin:g}"
     if lambda_list > 0:
         desc += f"-{opts.list_loss_type}-tau{list_tau:g}"
+    if opts.coupling_k > 0:
+        desc += f'-coupled{opts.coupling_k:d}'
+    if opts.lambda_list_d is not None:
+        desc += f'-listD{opts.lambda_list_d:g}'
+    if opts.lambda_list_g is not None:
+        desc += f'-listG{opts.lambda_list_g:g}'
     if opts.lambda_local_rank > 0:
         desc += f"-localrank{opts.lambda_local_rank:g}-k{opts.local_rank_k:d}"
     if path_rank_reg:

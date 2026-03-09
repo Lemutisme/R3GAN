@@ -873,6 +873,35 @@ class TestCliMappings(unittest.TestCase):
         self.assertIn("deprecated; use --path-rank-* instead", result.output)
         self.assertIn("deprecated and ignored", result.output)
 
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_coupling_k_creates_r3ganloss_with_coupling(self):
+        """Verify that coupling_k parameter is accepted by R3GANLoss."""
+        from training.loss import R3GANLoss
+
+        class TinyG(torch.nn.Module):
+            def __init__(self):
+                super(TinyG, self).__init__()
+                self.fc = torch.nn.Linear(4, 48)
+            def forward(self, z, c):
+                return self.fc(z).reshape(z.shape[0], 3, 4, 4)
+
+        class TinyD(torch.nn.Module):
+            def __init__(self):
+                super(TinyD, self).__init__()
+                self.fc = torch.nn.Linear(48, 1)
+            def forward(self, x, c, return_features=False):
+                f = x.reshape(x.shape[0], -1)
+                s = self.fc(f).squeeze(-1)
+                return (s, f) if return_features else s
+
+        loss = R3GANLoss(
+            G=TinyG(), D=TinyD(),
+            coupling_k=4, lambda_list_d=0.5, lambda_list_g=0.1, lambda_pair=1.0,
+        )
+        self.assertEqual(loss.coupling_k, 4)
+        self.assertEqual(loss.lambda_list_d, 0.5)
+        self.assertEqual(loss.lambda_list_g, 0.1)
+
 
 class TestLocalCoupling(unittest.TestCase):
 
