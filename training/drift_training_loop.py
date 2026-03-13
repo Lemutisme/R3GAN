@@ -80,6 +80,8 @@ def training_loop(
             data_loader_kwargs=data_loader_kwargs,
             G_kwargs=G_kwargs,
             G_opt_kwargs=G_opt_kwargs,
+            lr_scheduler=lr_scheduler,
+            beta2_scheduler=beta2_scheduler,
             metrics=metrics,
             random_seed=random_seed,
             num_gpus=num_gpus,

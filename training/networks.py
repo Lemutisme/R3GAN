@@ -89,21 +89,21 @@ class DiTLikeDriftGenerator(nn.Module):
         image_channels = int(kw.get('ImageChannels', 3))
         eval_alpha = float(kw.get('EvalAlpha', 1.0))
         self.EvalAlpha = eval_alpha
-        self.StyleTokenCount = int(kw.get('StyleTokenCount', 32))
+        self.StyleTokenCount = int(kw.get('StyleTokenCount', 0))
 
         config = DiTLikeConfig(
             image_size=self.img_resolution,
             in_channels=image_channels,
             out_channels=image_channels,
-            patch_size=int(kw.get('PatchSize', 8)),
+            patch_size=int(kw.get('PatchSize', 4)),
             hidden_dim=int(kw.get('HiddenDim', 256)),
-            depth=int(kw.get('Depth', 4)),
+            depth=int(kw.get('Depth', 6)),
             num_heads=int(kw.get('NumHeads', 8)),
             mlp_ratio=float(kw.get('MlpRatio', 4.0)),
             ffn_inner_dim=kw.get('FfnInnerDim', None),
             num_classes=max(self.c_dim, 1),
             register_tokens=int(kw.get('RegisterTokens', 16)),
-            style_vocab_size=int(kw.get('StyleVocabSize', 64)),
+            style_vocab_size=int(kw.get('StyleVocabSize', 1)),
             style_token_count=self.StyleTokenCount,
             alpha_hidden_dim=int(kw.get('AlphaHiddenDim', 128)),
             norm_type=str(kw.get('NormType', 'layernorm')),

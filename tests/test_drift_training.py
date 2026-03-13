@@ -1,9 +1,12 @@
 import io
 import inspect
+import json
 import os
 import pickle
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 REFERENCE_DRIFT_ROOT = "/workspace/drift_models"
@@ -22,6 +25,8 @@ except Exception:  # pragma: no cover
 if torch is not None:
     import legacy
     import train as train_cli
+    from training import drift_diagnostics as drift_diagnostics_impl
+    from training import drift_research as drift_research_impl
     from training import networks as training_networks
     from training import drift_training_loop as drift_training_loop_impl
     from training.drift_loss import (
@@ -42,18 +47,26 @@ if torch is not None:
             DriftingLossConfig as ReferenceDriftingLossConfig,
             drifting_stopgrad_loss as reference_drifting_stopgrad_loss,
         )
+        from drifting_models.models import DiTLikeConfig as ReferenceDiTLikeConfig
+        from drifting_models.models import DiTLikeGenerator as ReferenceDiTLikeGenerator
     except Exception:  # pragma: no cover
         ReferenceDriftFieldConfig = None
         ReferenceDriftingLossConfig = None
         reference_drifting_stopgrad_loss = None
+        ReferenceDiTLikeConfig = None
+        ReferenceDiTLikeGenerator = None
 else:  # pragma: no cover
     legacy = None
     train_cli = None
+    drift_diagnostics_impl = None
+    drift_research_impl = None
     training_networks = None
     drift_training_loop_impl = None
     ReferenceDriftFieldConfig = None
     ReferenceDriftingLossConfig = None
     reference_drifting_stopgrad_loss = None
+    ReferenceDiTLikeConfig = None
+    ReferenceDiTLikeGenerator = None
 
 
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
@@ -190,6 +203,45 @@ class TestDriftTrainingLoopCompatibility(unittest.TestCase):
                 )
 
 
+@unittest.skipIf(torch is None or drift_research_impl is None, "Drift research trainer is not available")
+class TestDriftResearchMetricOutputs(unittest.TestCase):
+    def test_write_periodic_metric_jsonls_emits_compatibility_files(self):
+        eval_entry = {
+            "fid": 405.0,
+            "fid50k_full": 406.0,
+            "fid50k_fullb": 407.0,
+            "inception_score_mean": 1.25,
+            "step": 392,
+            "generated_images_total": 200000,
+            "generated_kimg_total": 200.0,
+            "generated_samples": 50000,
+            "reference_samples": 10000,
+            "eval_time_s": 28.0,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            drift_research_impl._write_periodic_metric_jsonls(
+                run_dir=tmpdir,
+                metrics=["fid50k_full"],
+                eval_entry=eval_entry,
+            )
+
+            fid_path = Path(tmpdir) / "metric-fid50k_full.jsonl"
+            fidb_path = Path(tmpdir) / "metric-fid50k_fullb.jsonl"
+            fid_alias_missing = Path(tmpdir) / "metric-fid.jsonl"
+
+            self.assertTrue(fid_path.exists())
+            self.assertTrue(fidb_path.exists())
+            self.assertFalse(fid_alias_missing.exists())
+
+            fid_payload = json.loads(fid_path.read_text(encoding="utf-8").strip())
+            fidb_payload = json.loads(fidb_path.read_text(encoding="utf-8").strip())
+            self.assertEqual(fid_payload["metric"], "fid50k_full")
+            self.assertEqual(fid_payload["results"]["fid50k_full"], 406.0)
+            self.assertEqual(fidb_payload["metric"], "fid50k_fullb")
+            self.assertEqual(fidb_payload["results"]["fid50k_fullb"], 407.0)
+
+
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
 class TestDriftQueue(unittest.TestCase):
     def test_positive_sampling_preserves_class_identity(self):
@@ -312,6 +364,76 @@ class TestDriftGenerator(unittest.TestCase):
         self.assertTrue(torch.allclose(out_default, out_explicit, atol=1e-6))
 
 
+@unittest.skipIf(torch is None or drift_diagnostics_impl is None, "Drift diagnostics are not available")
+class TestDriftDiagnostics(unittest.TestCase):
+    def test_collect_generator_diagnostics_emits_conditioning_metrics(self):
+        generator = training_networks.DiTLikeDriftGenerator(
+            FP16Stages=[],
+            c_dim=4,
+            img_resolution=8,
+            ImageChannels=3,
+            PatchSize=4,
+            HiddenDim=32,
+            Depth=2,
+            NumHeads=4,
+            RegisterTokens=2,
+            StyleTokenCount=4,
+            StyleVocabSize=8,
+            EvalAlpha=1.5,
+        )
+
+        diagnostics = drift_diagnostics_impl.collect_generator_diagnostics(
+            generator=generator,
+            device=torch.device('cpu'),
+            batch_size=4,
+            num_classes=4,
+            eval_alpha=1.5,
+            alpha_pair=(1.0, 4.0),
+            seed=7,
+        )
+        self.assertIn('pairwise_l2_mean', diagnostics)
+        self.assertIn('diff_class_l2', diagnostics)
+        self.assertIn('diff_style_l2', diagnostics)
+        self.assertIn('class_cond_norm_mean', diagnostics)
+        self.assertIn('style_cond_norm_mean', diagnostics)
+        self.assertGreaterEqual(diagnostics['pairwise_l2_mean'], 0.0)
+
+    @unittest.skipIf(
+        ReferenceDiTLikeConfig is None or ReferenceDiTLikeGenerator is None,
+        "Reference DiT-like generator is not available",
+    )
+    def test_reference_dit_like_style_condition_scales_by_sqrt_token_count(self):
+        model = ReferenceDiTLikeGenerator(
+            ReferenceDiTLikeConfig(
+                image_size=8,
+                in_channels=3,
+                out_channels=3,
+                patch_size=4,
+                hidden_dim=8,
+                depth=1,
+                num_heads=2,
+                num_classes=3,
+                register_tokens=0,
+                style_vocab_size=2,
+                style_token_count=4,
+            )
+        )
+        with torch.no_grad():
+            model.class_embedding.weight.zero_()
+            for parameter in model.alpha_embedding.parameters():
+                parameter.zero_()
+            model.style_embedding.weight.fill_(1.0)
+
+        condition = model._build_conditioning(
+            class_labels=torch.zeros(2, dtype=torch.long),
+            alpha=torch.zeros(2),
+            style_indices=torch.zeros(2, 4, dtype=torch.long),
+            device=torch.device('cpu'),
+            batch=2,
+        )
+        self.assertTrue(torch.allclose(condition, torch.full_like(condition, 2.0)))
+
+
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
 class TestDriftLegacyCompatibility(unittest.TestCase):
     def test_legacy_loader_accepts_drift_snapshot_without_discriminator(self):
@@ -330,6 +452,121 @@ class TestDriftLegacyCompatibility(unittest.TestCase):
         loaded = legacy.load_network_pkl(buffer)
         self.assertIsNone(loaded["D"])
         self.assertIsInstance(loaded["G_ema"], torch.nn.Module)
+
+
+@unittest.skipIf(torch is None or drift_research_impl is None, "Drift research trainer is not available")
+class TestDriftEMA(unittest.TestCase):
+    def test_ema_update_differs_from_direct_copy(self):
+        """EMA update should produce params between old and new, not equal to new."""
+        torch.manual_seed(99)
+        model = torch.nn.Linear(4, 4, bias=False)
+        ema_model = torch.nn.Linear(4, 4, bias=False)
+        with torch.no_grad():
+            ema_model.weight.copy_(model.weight)
+            old_ema_weight = ema_model.weight.clone()
+            model.weight.add_(torch.randn_like(model.weight))
+
+        drift_research_impl._ema_update(src=model, dst=ema_model, decay=0.999)
+
+        # EMA should NOT equal current model (not a direct copy)
+        self.assertFalse(torch.allclose(ema_model.weight, model.weight))
+        # EMA should NOT equal old weights either (it moved)
+        self.assertFalse(torch.allclose(ema_model.weight, old_ema_weight))
+
+    def test_ema_update_copies_buffers_directly(self):
+        """Buffers (e.g. BatchNorm running stats) should be copied, not EMA-smoothed."""
+        model = torch.nn.BatchNorm1d(4)
+        ema_model = torch.nn.BatchNorm1d(4)
+        with torch.no_grad():
+            model.running_mean.fill_(5.0)
+
+        drift_research_impl._ema_update(src=model, dst=ema_model, decay=0.999)
+        self.assertTrue(torch.allclose(ema_model.running_mean, model.running_mean))
+
+    def test_ema_smoothing_over_multiple_steps(self):
+        """After N updates with consistent drift, EMA should track the model."""
+        torch.manual_seed(42)
+        model = torch.nn.Linear(8, 8, bias=False)
+        ema = torch.nn.Linear(8, 8, bias=False)
+        with torch.no_grad():
+            ema.weight.copy_(model.weight)
+        initial_ema_weight = ema.weight.clone()
+
+        # Apply a consistent positive shift so EMA can track it
+        for _ in range(100):
+            with torch.no_grad():
+                model.weight.add_(torch.ones_like(model.weight) * 0.01)
+            drift_research_impl._ema_update(src=model, dst=ema, decay=0.99)
+
+        # EMA should have moved away from initial value
+        self.assertFalse(torch.allclose(ema.weight, initial_ema_weight, atol=1e-3))
+        # EMA should NOT equal current model (it lags)
+        self.assertFalse(torch.allclose(ema.weight, model.weight, atol=1e-3))
+        # EMA should be between initial and current: all values increased
+        self.assertTrue((ema.weight > initial_ema_weight).all())
+
+
+@unittest.skipIf(torch is None or drift_research_impl is None, "Drift research trainer is not available")
+class TestR3GANConvStepParity(unittest.TestCase):
+    def test_r3gan_conv_step_uses_multi_temperature(self):
+        """_run_r3gan_conv_step should use drift_temperatures when specified."""
+        from types import SimpleNamespace
+        from training.drift_reference import ClassConditionalSampleQueue, QueueConfig
+
+        class FakeConvGenerator(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 3 * 4 * 4)
+                self.z_dim = 4
+                self.c_dim = 2
+
+            def forward(self, z, c, alpha=None):
+                return self.linear(z).reshape(z.shape[0], 3, 4, 4)
+
+        gen = FakeConvGenerator()
+        opt = torch.optim.Adam(gen.parameters(), lr=1e-4)
+        queue = ClassConditionalSampleQueue(QueueConfig(num_classes=2, per_class_capacity=16, global_capacity=32))
+        for _ in range(4):
+            queue.push(torch.randn(8, 3, 4, 4), torch.randint(0, 2, (8,)))
+
+        class FakeProvider:
+            def next_batch(self, *, device):
+                return torch.randn(8, 3, 4, 4, device=device), torch.randint(0, 2, (8,), device=device)
+
+        drift = SimpleNamespace(
+            negatives_per_group=2,
+            positives_per_group=2,
+            unconditional_per_group=1,
+            drift_temperature=0.05,
+            drift_temperatures=[0.02, 0.05, 0.2],
+            drift_temperature_reduction='sum',
+            clip_grad_norm=2.0,
+            queue_refill_policy='per_step',
+            queue_refill_every=1,
+            queue_push_batch=4,
+            queue_strict_without_replacement=False,
+            use_feature_loss=False,
+        )
+
+        stats = drift_research_impl._run_r3gan_conv_step(
+            generator=gen,
+            optimizer=opt,
+            queue=queue,
+            provider=FakeProvider(),
+            step=0,
+            local_groups=2,
+            num_classes=2,
+            drift=drift,
+            image_channels=3,
+            image_size=4,
+            class_labels=torch.tensor([0, 1]),
+            alpha=torch.tensor([2.0, 3.0]),
+            device=torch.device('cpu'),
+        )
+        self.assertIn('loss', stats)
+        self.assertIn('mean_drift_norm', stats)
+        self.assertIn('grad_norm', stats)
+        self.assertGreater(stats['loss'], 0.0)
 
 
 @unittest.skipIf(
@@ -392,7 +629,15 @@ class TestDriftCliMappings(unittest.TestCase):
         self.assertEqual(config.G_kwargs.HiddenDim, 256)
         self.assertEqual(config.drift_config.backbone, "dit_like")
         self.assertEqual(config.drift_config.alpha_max, 3.0)
-        self.assertEqual(config.G_opt_kwargs.class_name, "torch.optim.AdamW")
+        self.assertEqual(config.G_kwargs.PatchSize, 4)
+        self.assertEqual(config.G_kwargs.Depth, 6)
+        self.assertEqual(config.G_kwargs.StyleVocabSize, 1)
+        self.assertEqual(config.G_kwargs.StyleTokenCount, 0)
+        self.assertEqual(config.G_opt_kwargs.class_name, "torch.optim.Adam")
+        self.assertEqual(config.G_opt_kwargs.lr, 2e-4)
+        self.assertEqual(config.G_opt_kwargs.betas, [0.0, 0.0])
+        self.assertIsNotNone(config.lr_scheduler)
+        self.assertIsNotNone(config.beta2_scheduler)
         self.assertIsNone(config.D_kwargs)
 
     def test_drift_cli_requires_conditional_labels(self):
@@ -412,3 +657,67 @@ class TestDriftCliMappings(unittest.TestCase):
         config = launch_training.call_args.kwargs["c"]
         self.assertEqual(config.G_kwargs.class_name, "training.networks.DriftGenerator")
         self.assertEqual(config.drift_config.backbone, "r3gan_conv")
+
+    def test_drift_cli_uses_adamw_when_weight_decay_is_enabled(self):
+        result, launch_training = self._invoke_train(
+            [
+                "--trainer=drift",
+                "--cond=1",
+                "--weight-decay=0.01",
+            ]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        config = launch_training.call_args.kwargs["c"]
+        self.assertEqual(config.G_opt_kwargs.class_name, "torch.optim.AdamW")
+        self.assertEqual(config.G_opt_kwargs.weight_decay, 0.01)
+
+    def test_drift_cli_custom_learning_rate_disables_preset_lr_scheduler_for_dit_like(self):
+        result, launch_training = self._invoke_train(
+            [
+                "--trainer=drift",
+                "--cond=1",
+                "--learning-rate=1e-4",
+            ]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        config = launch_training.call_args.kwargs["c"]
+        self.assertIsNone(config.lr_scheduler)
+
+    def test_drift_cli_auto_maps_metrics_to_periodic_eval(self):
+        with mock.patch.object(
+            train_cli,
+            "_infer_drift_periodic_eval_paths",
+            return_value=("/tmp/cifar10_val", "/tmp/reference_stats.pt"),
+        ):
+            result, launch_training = self._invoke_train(
+                [
+                    "--trainer=drift",
+                    "--cond=1",
+                    "--metrics=fid50k_full",
+                ]
+            )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        config = launch_training.call_args.kwargs["c"]
+        self.assertEqual(config.drift_config.eval_every_kimg, 200.0)
+        self.assertEqual(config.drift_config.eval_reference_imagefolder_root, "/tmp/cifar10_val")
+        self.assertEqual(config.drift_config.eval_reference_stats_path, "/tmp/reference_stats.pt")
+        self.assertIn("enabling drift periodic eval to mirror --metrics", result.output)
+
+    def test_drift_cli_keeps_periodic_eval_disabled_when_metrics_none(self):
+        with mock.patch.object(
+            train_cli,
+            "_infer_drift_periodic_eval_paths",
+            return_value=("/tmp/cifar10_val", "/tmp/reference_stats.pt"),
+        ):
+            result, launch_training = self._invoke_train(
+                [
+                    "--trainer=drift",
+                    "--cond=1",
+                    "--metrics=none",
+                ]
+            )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        config = launch_training.call_args.kwargs["c"]
+        self.assertEqual(config.drift_config.eval_every_kimg, 0.0)
+        self.assertEqual(config.drift_config.eval_reference_imagefolder_root, None)
+        self.assertEqual(config.drift_config.eval_reference_stats_path, None)

@@ -19,6 +19,7 @@ from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 
+from training.drift_diagnostics import collect_generator_diagnostics
 from training.drift_reference import (
     ClassConditionalSampleQueue,
     DriftFieldConfig,
@@ -54,7 +55,7 @@ from training.drift_reference import (
     save_training_checkpoint,
     write_json,
 )
-from training.training_loop import save_image_grid, setup_snapshot_image_grid
+from training.training_loop import cosine_decay_with_warmup, save_image_grid, setup_snapshot_image_grid
 
 
 def training_loop(
@@ -63,6 +64,8 @@ def training_loop(
     data_loader_kwargs={},
     G_kwargs={},
     G_opt_kwargs={},
+    lr_scheduler=None,
+    beta2_scheduler=None,
     metrics=[],
     random_seed=0,
     num_gpus=1,
@@ -215,12 +218,14 @@ def training_loop(
         clip_grad_norm=float(drift.clip_grad_norm),
         run_optimizer_step=True,
     )
-    scheduler = build_lr_scheduler(
-        optimizer=optimizer,
-        scheduler_name=str(drift.scheduler),
-        total_steps=max(1, _total_steps(total_kimg=total_kimg, batch_size=batch_size)),
-        warmup_steps=int(drift.warmup_steps),
-    )
+    scheduler = None
+    if lr_scheduler is None:
+        scheduler = build_lr_scheduler(
+            optimizer=optimizer,
+            scheduler_name=str(drift.scheduler),
+            total_steps=max(1, _total_steps(total_kimg=total_kimg, batch_size=batch_size)),
+            warmup_steps=int(drift.warmup_steps),
+        )
     feature_extractor = None
     if drift.use_feature_loss:
         feature_extractor = build_feature_extractor(args=drift_args, device=device).eval()
@@ -349,6 +354,14 @@ def training_loop(
         step_start_time = time.perf_counter()
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(device)
+        if lr_scheduler is not None:
+            cur_lr = cosine_decay_with_warmup(cur_nimg, **lr_scheduler)
+            for group in optimizer.param_groups:
+                group['lr'] = float(cur_lr)
+        if beta2_scheduler is not None:
+            cur_beta2 = cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
+            for group in optimizer.param_groups:
+                group['betas'] = (float(group['betas'][0]), float(cur_beta2))
 
         class_labels = torch.randint(0, num_classes, (local_groups,), device=device)
         alpha = sample_alpha(
@@ -371,12 +384,21 @@ def training_loop(
                 int(training_set.resolution),
                 device=device,
             )
-            style_indices = torch.randint(
-                0,
-                int(drift.style_vocab_size),
-                (local_groups, int(drift.negatives_per_group), int(drift.style_token_count)),
-                device=device,
-            )
+            if int(drift.style_token_count) > 0:
+                style_indices = torch.randint(
+                    0,
+                    int(drift.style_vocab_size),
+                    (local_groups, int(drift.negatives_per_group), int(drift.style_token_count)),
+                    device=device,
+                )
+            else:
+                style_indices = torch.zeros(
+                    local_groups,
+                    int(drift.negatives_per_group),
+                    0,
+                    device=device,
+                    dtype=torch.long,
+                )
             should_refill = str(drift.queue_refill_policy) == 'per_step' or (
                 str(drift.queue_refill_policy) == 'every_n_steps'
                 and ((step - start_step) % max(1, int(drift.queue_refill_every)) == 0)
@@ -439,11 +461,13 @@ def training_loop(
                 class_labels=class_labels,
                 alpha=alpha,
                 device=device,
+                step_config=step_config,
+                feature_extractor=feature_extractor,
             )
 
         if scheduler is not None:
             scheduler.step()
-        misc.copy_params_and_buffers(g, g_ema, require_all=False)
+        _ema_update(src=g, dst=g_ema, decay=float(drift.ema_decay))
 
         step_time_s = time.perf_counter() - step_start_time
         generated_images_total = int((step + 1) * batch_size)
@@ -452,6 +476,7 @@ def training_loop(
         stats['generated_images_total'] = float(generated_images_total)
         stats['generated_kimg_total'] = float(generated_images_total / 1000.0)
         stats['lr'] = float(optimizer.param_groups[0]['lr'])
+        stats['beta2'] = float(optimizer.param_groups[0]['betas'][1])
         stats['peak_cuda_mem_mb'] = float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)) if device.type == 'cuda' else 0.0
         stats['queue_global_count'] = float(queue.global_count())
         stats['queue_covered_classes'] = float(sum(1 for count in queue.class_counts() if count > 0))
@@ -460,6 +485,8 @@ def training_loop(
         training_stats.report('Loss/G/loss', torch.as_tensor(float(stats['loss']), device=device))
         training_stats.report('Loss/drift_norm', torch.as_tensor(float(stats.get('mean_drift_norm', stats.get('drift_norm', 0.0))), device=device))
         training_stats.report('Progress/alpha_mean', torch.as_tensor(float(stats.get('alpha_mean', alpha.mean().item())), device=device))
+        training_stats.report('Progress/lr', torch.as_tensor(float(stats['lr']), device=device))
+        training_stats.report('Progress/beta2', torch.as_tensor(float(stats['beta2']), device=device))
         training_stats.report('Progress/queue_global_count', torch.as_tensor(float(queue.global_count()), device=device))
 
         should_log_step = (step == start_step) or ((step + 1) % max(1, int(kimg_per_tick)) == 0)
@@ -474,6 +501,16 @@ def training_loop(
             continue
 
         tick_end_time = time.time()
+        diagnostic_stats = None
+        if rank == 0:
+            diagnostic_stats = _collect_training_diagnostics(
+                generator=g_ema,
+                drift=drift,
+                device=device,
+                num_classes=num_classes,
+            )
+            _merge_diagnostic_stats(stats=stats, diagnostics=diagnostic_stats)
+            _report_diagnostic_stats(diagnostics=diagnostic_stats)
         training_stats.report0('Progress/tick', cur_tick)
         training_stats.report0('Progress/kimg', cur_nimg / 1e3)
         training_stats.report0('Timing/total_sec', tick_end_time - start_time)
@@ -493,6 +530,13 @@ def training_loop(
                 f'alpha {float(stats.get("alpha_mean", alpha.mean().item())):.3f}',
                 f'queue {queue.global_count():<6d}',
             ]
+            if diagnostic_stats is not None:
+                if diagnostic_stats.get('pairwise_l2_mean') is not None:
+                    fields.append(f'pairL2 {float(diagnostic_stats["pairwise_l2_mean"]):.2f}')
+                if diagnostic_stats.get('diff_class_l2') is not None:
+                    fields.append(f'clsL2 {float(diagnostic_stats["diff_class_l2"]):.2f}')
+                if diagnostic_stats.get('diff_style_l2') is not None:
+                    fields.append(f'styL2 {float(diagnostic_stats["diff_style_l2"]):.2f}')
             print(' '.join(fields))
 
         save_images = rank == 0 and (done or (image_snapshot_ticks is not None and cur_tick % image_snapshot_ticks == 0))
@@ -530,6 +574,16 @@ def training_loop(
                 resolved_config_hash=resolved_config_hash,
                 provider_manifest_fingerprint=provider_manifest_fingerprint,
             )
+            if rank == 0 and diagnostic_stats is not None:
+                write_json(
+                    _snapshot_diagnostics_path(snapshot_path),
+                    {
+                        'generated_images_total': int(cur_nimg),
+                        'generated_kimg_total': float(cur_nimg / 1000.0),
+                        'snapshot_path': str(snapshot_path),
+                        **diagnostic_stats,
+                    },
+                )
 
         if eval_state is not None and rank == 0:
             interval_generated_images = _eval_interval_generated_images(drift)
@@ -545,6 +599,11 @@ def training_loop(
                 )
                 periodic_evals.append(eval_entry)
                 append_jsonl(path=Path(run_dir) / 'periodic_eval_history.jsonl', payload=eval_entry)
+                _write_periodic_metric_jsonls(
+                    run_dir=run_dir,
+                    metrics=metrics,
+                    eval_entry=eval_entry,
+                )
                 for metric_name in ('fid', 'fid50k_full', 'fid50k_fullb', 'inception_score_mean'):
                     if metric_name in eval_entry:
                         append_jsonl(
@@ -618,13 +677,14 @@ def _build_drift_args(*, drift_config, batch_size, num_gpus, run_dir):
         drift_temperature=0.05,
         drift_temperatures=[],
         drift_temperature_reduction='sum',
-        learning_rate=1e-4,
-        adam_beta1=0.9,
-        adam_beta2=0.999,
-        weight_decay=0.01,
+        learning_rate=2e-4,
+        adam_beta1=0.0,
+        adam_beta2=0.0,
+        weight_decay=0.0,
         scheduler='none',
         warmup_steps=0,
         clip_grad_norm=2.0,
+        ema_decay=0.999,
         compile_generator=False,
         compile_backend='inductor',
         compile_mode='reduce-overhead',
@@ -701,15 +761,15 @@ def _build_drift_args(*, drift_config, batch_size, num_gpus, run_dir):
         eval_inception_weights='pretrained',
         eval_postprocess_mode='clamp_0_1',
         eval_alpha=1.0,
-        patch_size=8,
+        patch_size=4,
         hidden_dim=256,
-        depth=4,
+        depth=6,
         num_heads=8,
         mlp_ratio=4.0,
         ffn_inner_dim=None,
         register_tokens=16,
-        style_vocab_size=64,
-        style_token_count=32,
+        style_vocab_size=1,
+        style_token_count=0,
         alpha_hidden_dim=128,
         norm_type='layernorm',
         use_qk_norm=False,
@@ -1042,6 +1102,61 @@ def _write_static_artifacts(*, run_dir, provider_manifest_fingerprint):
     )
 
 
+def _collect_training_diagnostics(*, generator, drift, device, num_classes):
+    return collect_generator_diagnostics(
+        generator=generator,
+        device=device,
+        batch_size=8,
+        num_classes=int(num_classes),
+        eval_alpha=float(drift.eval_alpha),
+        alpha_pair=(float(drift.alpha_min), float(drift.alpha_max)),
+        seed=1234,
+    )
+
+
+def _merge_diagnostic_stats(*, stats, diagnostics):
+    mapping = {
+        'pixel_std_all': 'diag_pixel_std_all',
+        'across_sample_std_mean': 'diag_across_sample_std_mean',
+        'pairwise_l2_mean': 'diag_pairwise_l2_mean',
+        'diff_class_l2': 'diag_diff_class_l2',
+        'diff_alpha_l2': 'diag_diff_alpha_l2',
+        'diff_style_l2': 'diag_diff_style_l2',
+        'class_cond_norm_mean': 'diag_class_cond_norm_mean',
+        'alpha_cond_norm_mean': 'diag_alpha_cond_norm_mean',
+        'style_cond_norm_mean': 'diag_style_cond_norm_mean',
+        'combined_cond_norm_mean': 'diag_combined_cond_norm_mean',
+    }
+    for src_name, dst_name in mapping.items():
+        value = diagnostics.get(src_name)
+        if value is not None:
+            stats[dst_name] = float(value)
+
+
+def _report_diagnostic_stats(*, diagnostics):
+    mapping = {
+        'pixel_std_all': 'Diag/pixel_std_all',
+        'across_sample_std_mean': 'Diag/across_sample_std_mean',
+        'pairwise_l2_mean': 'Diag/pairwise_l2_mean',
+        'diff_class_l2': 'Diag/diff_class_l2',
+        'diff_alpha_l2': 'Diag/diff_alpha_l2',
+        'diff_style_l2': 'Diag/diff_style_l2',
+        'class_cond_norm_mean': 'Diag/class_cond_norm_mean',
+        'alpha_cond_norm_mean': 'Diag/alpha_cond_norm_mean',
+        'style_cond_norm_mean': 'Diag/style_cond_norm_mean',
+        'combined_cond_norm_mean': 'Diag/combined_cond_norm_mean',
+    }
+    for src_name, dst_name in mapping.items():
+        value = diagnostics.get(src_name)
+        if value is not None:
+            training_stats.report0(dst_name, float(value))
+
+
+def _snapshot_diagnostics_path(snapshot_path):
+    snapshot_path = Path(snapshot_path)
+    return snapshot_path.with_name(snapshot_path.name.replace('network-snapshot-', 'snapshot-diagnostics-').replace('.pkl', '.json'))
+
+
 def _save_fake_grid(*, generator, drift, grid_size, class_ids, path, device):
     generator.eval()
     batch = int(class_ids.shape[0])
@@ -1087,8 +1202,35 @@ def _eval_interval_generated_images(drift):
     return int(math.ceil(float(drift.eval_every_kimg) * 1000.0))
 
 
+def _periodic_metric_file_names(*, metrics, eval_entry):
+    metric_names = []
+    seen = set()
+    for metric_name in list(metrics or []) + ['fid50k_full', 'fid50k_fullb']:
+        if metric_name in eval_entry and metric_name not in seen:
+            metric_names.append(str(metric_name))
+            seen.add(metric_name)
+    return tuple(metric_names)
+
+
+def _write_periodic_metric_jsonls(*, run_dir, metrics, eval_entry):
+    for metric_name in _periodic_metric_file_names(metrics=metrics, eval_entry=eval_entry):
+        append_jsonl(
+            path=Path(run_dir) / f'metric-{metric_name}.jsonl',
+            payload=metric_jsonl_entry(eval_entry=eval_entry, metric_name=metric_name),
+        )
+
+
 def _total_steps(*, total_kimg, batch_size):
     return max(1, int(math.ceil(float(total_kimg) * 1000.0 / float(batch_size))))
+
+
+def _ema_update(*, src, dst, decay):
+    """Exponential moving average: dst = decay * dst + (1 - decay) * src."""
+    with torch.no_grad():
+        for p_dst, p_src in zip(dst.parameters(), src.parameters()):
+            p_dst.lerp_(p_src, 1.0 - decay)
+        for b_dst, b_src in zip(dst.buffers(), src.buffers()):
+            b_dst.copy_(b_src)
 
 
 def _class_ids_from_labels(labels):
@@ -1099,9 +1241,7 @@ def _class_ids_from_labels(labels):
     raise ValueError(f'labels must be [B] or [B, C], got {tuple(labels.shape)}')
 
 
-def _run_r3gan_conv_step(*, generator, optimizer, queue, provider, step, local_groups, num_classes, drift, image_channels, image_size, class_labels, alpha, device):
-    from training.drift_loss import DriftLossConfig, grouped_drifting_stopgrad_loss
-
+def _run_r3gan_conv_step(*, generator, optimizer, queue, provider, step, local_groups, num_classes, drift, image_channels, image_size, class_labels, alpha, device, step_config=None, feature_extractor=None):
     should_refill = str(drift.queue_refill_policy) == 'per_step' or (
         str(drift.queue_refill_policy) == 'every_n_steps'
         and (step % max(1, int(drift.queue_refill_every)) == 0)
@@ -1109,7 +1249,7 @@ def _run_r3gan_conv_step(*, generator, optimizer, queue, provider, step, local_g
     if should_refill:
         refill_images, refill_labels = _sample_real_batch(provider=provider, count=int(drift.queue_push_batch), device=device)
         queue.push(refill_images, refill_labels)
-    ensure_queue_has_labels(
+    backfilled = ensure_queue_has_labels(
         queue=queue,
         class_labels=class_labels,
         provider=provider,
@@ -1137,27 +1277,116 @@ def _run_r3gan_conv_step(*, generator, optimizer, queue, provider, step, local_g
         device=device,
         dtype=torch.float32,
     )
-    z = torch.randn([local_groups * int(drift.negatives_per_group), generator.z_dim], device=device)
+
+    negatives_per_group = int(drift.negatives_per_group)
+    z = torch.randn([local_groups * negatives_per_group, generator.z_dim], device=device)
     one_hot = torch.zeros([z.shape[0], num_classes], device=device, dtype=torch.float32)
-    one_hot.scatter_(1, class_labels.repeat_interleave(int(drift.negatives_per_group)).view(-1, 1), 1.0)
-    fake_images = generator(z, one_hot, alpha=alpha.repeat_interleave(int(drift.negatives_per_group)))
-    fake_grouped = fake_images.reshape(local_groups, int(drift.negatives_per_group), image_channels, image_size, image_size)
-    optimizer.zero_grad(set_to_none=True)
-    loss, loss_stats = grouped_drifting_stopgrad_loss(
-        x_grouped=fake_grouped,
-        y_pos_grouped=positives_grouped,
-        unconditional_grouped=unconditional_grouped,
-        unconditional_weight_grouped=unconditional_weight_grouped,
-        config=DriftLossConfig(temperature=float(drift.drift_temperature)),
+    one_hot.scatter_(1, class_labels.repeat_interleave(negatives_per_group).view(-1, 1), 1.0)
+    fake_images = generator(z, one_hot, alpha=alpha.repeat_interleave(negatives_per_group))
+    fake_grouped = fake_images.reshape(local_groups, negatives_per_group, image_channels, image_size, image_size)
+
+    if step_config is None:
+        step_config = GroupedDriftStepConfig(
+            loss_config=DriftingLossConfig(
+                drift_field=DriftFieldConfig(
+                    temperature=float(drift.drift_temperature),
+                    normalize_over_x=True,
+                    mask_self_negatives=True,
+                ),
+                attraction_scale=1.0,
+                repulsion_scale=1.0,
+                stopgrad_target=True,
+            ),
+            feature_config=_build_feature_config(drift),
+            drift_temperatures=tuple(float(v) for v in drift.drift_temperatures),
+            drift_temperature_reduction=str(drift.drift_temperature_reduction),
+            clip_grad_norm=float(drift.clip_grad_norm),
+            run_optimizer_step=False,
+        )
+
+    from drifting_models.drift_field import build_negative_log_weights
+    from drifting_models.drift_loss import (
+        drifting_stopgrad_loss,
+        drifting_stopgrad_loss_multi_temperature,
+        feature_space_drifting_loss,
     )
-    loss.backward()
-    if float(drift.clip_grad_norm) > 0:
-        torch.nn.utils.clip_grad_norm_(generator.parameters(), float(drift.clip_grad_norm))
+    from drifting_models.features.vectorize import extract_feature_maps, vectorize_feature_maps
+
+    losses = []
+    drift_norms = []
+    for g_idx in range(local_groups):
+        gen_group = fake_grouped[g_idx]
+        pos_group = positives_grouped[g_idx]
+        unc_group = None if unconditional_grouped is None else unconditional_grouped[g_idx]
+        unc_weight = float(unconditional_weight_grouped[g_idx].item())
+
+        if step_config.feature_config is not None and feature_extractor is not None:
+            gen_feats = vectorize_feature_maps(extract_feature_maps(feature_extractor, gen_group), step_config.feature_config.vectorization)
+            pos_feats = vectorize_feature_maps(extract_feature_maps(feature_extractor, pos_group), step_config.feature_config.vectorization)
+            unc_feats = None
+            if unc_group is not None:
+                unc_feats = vectorize_feature_maps(extract_feature_maps(feature_extractor, unc_group), step_config.feature_config.vectorization)
+            loss, stats = feature_space_drifting_loss(
+                generated_feature_vectors=gen_feats,
+                positive_feature_vectors=pos_feats,
+                unconditional_feature_vectors=unc_feats,
+                base_loss_config=step_config.loss_config,
+                feature_config=step_config.feature_config,
+                unconditional_weight=unc_weight,
+            )
+        else:
+            gen_vec = gen_group.reshape(gen_group.shape[0], -1)
+            pos_vec = pos_group.reshape(pos_group.shape[0], -1)
+            neg_vec = gen_vec
+            neg_log_w = None
+            if unc_group is not None:
+                unc_vec = unc_group.reshape(unc_group.shape[0], -1)
+                neg_vec = torch.cat([gen_vec, unc_vec], dim=0)
+                neg_log_w = build_negative_log_weights(
+                    n_generated_negatives=gen_vec.shape[0],
+                    n_unconditional_negatives=unc_vec.shape[0],
+                    unconditional_weight=unc_weight,
+                    device=gen_vec.device,
+                    dtype=gen_vec.dtype,
+                )
+            if step_config.drift_temperatures:
+                loss, stats = drifting_stopgrad_loss_multi_temperature(
+                    x=gen_vec, y_pos=pos_vec, y_neg=neg_vec,
+                    temperatures=tuple(step_config.drift_temperatures),
+                    config=step_config.loss_config,
+                    negative_log_weights=neg_log_w,
+                    generated_negative_count=gen_vec.shape[0],
+                    reduction=str(step_config.drift_temperature_reduction),
+                )
+            else:
+                loss, _, stats = drifting_stopgrad_loss(
+                    x=gen_vec, y_pos=pos_vec, y_neg=neg_vec,
+                    config=step_config.loss_config,
+                    negative_log_weights=neg_log_w,
+                    generated_negative_count=gen_vec.shape[0],
+                )
+
+        losses.append(loss)
+        drift_norms.append(stats.get('mean_drift_norm', stats.get('drift_norm', 0.0)))
+
+    total_loss = torch.stack(losses).mean()
+    optimizer.zero_grad(set_to_none=True)
+    total_loss.backward()
+    grad_norm = None
+    clip = step_config.clip_grad_norm
+    if clip is not None and clip > 0:
+        grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), clip)
     optimizer.step()
-    return {
-        **loss_stats,
-        'loss': float(loss.item()),
+
+    result = {
+        'loss': float(total_loss.item()),
+        'mean_drift_norm': float(sum(drift_norms) / max(len(drift_norms), 1)),
+        'groups': local_groups,
+        'negatives_per_group': negatives_per_group,
         'alpha_mean': float(alpha.mean().item()),
         'alpha_min': float(alpha.min().item()),
         'alpha_max': float(alpha.max().item()),
+        'grad_norm': None if grad_norm is None else float(grad_norm.item()),
+        'queue_underflow_backfilled': float(backfilled),
     }
+    return result

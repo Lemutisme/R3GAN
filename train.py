@@ -11,6 +11,7 @@ import click
 import re
 import json
 import tempfile
+from pathlib import Path
 import torch
 from torch.utils.cpp_extension import verify_ninja_availability
 
@@ -208,6 +209,72 @@ def parse_float_list(s):
 
 def parse_int_list(s):
     return [int(x) for x in parse_comma_separated_list(s)]
+
+
+# ----------------------------------------------------------------------------
+
+
+def _canonical_dataset_slug(dataset_name, data_path):
+    candidates = []
+    if dataset_name is not None:
+        candidates.append(str(dataset_name))
+    if data_path is not None:
+        candidates.append(Path(str(data_path)).stem)
+
+    for raw_value in candidates:
+        normalized = re.sub(r"[^a-z0-9]+", "", str(raw_value).lower())
+        if "cifar10" in normalized:
+            return "cifar10"
+        if "imagenet1k" in normalized:
+            return "imagenet1k"
+        if normalized.startswith("imagenet"):
+            return "imagenet1k"
+        if "ffhq" in normalized:
+            return "ffhq"
+    return None
+
+
+def _infer_drift_periodic_eval_paths(*, dataset_name, data_path, inception_weights):
+    dataset_slug = _canonical_dataset_slug(dataset_name=dataset_name, data_path=data_path)
+    if dataset_slug is None:
+        return None, None
+
+    workspace_root = Path(__file__).resolve().parent.parent
+    outputs_roots = [
+        workspace_root / "outputs",
+        workspace_root / "drift_models" / "outputs",
+    ]
+
+    root_candidates = []
+    stats_candidates = []
+
+    if dataset_slug == "imagenet1k":
+        for base in outputs_roots:
+            root_candidates.extend(
+                [
+                    base / "datasets" / "imagenet1k_val",
+                    base / "datasets" / "imagenet1k_raw" / "val",
+                ]
+            )
+            stats_candidates.extend(
+                [
+                    base / "datasets" / f"imagenet1k_val_reference_stats_{inception_weights}.pt",
+                    base / "imagenet_eval" / f"reference_stats_{inception_weights}.pt",
+                ]
+            )
+    else:
+        for base in outputs_roots:
+            root_candidates.append(base / "datasets" / f"{dataset_slug}_val")
+            stats_candidates.extend(
+                [
+                    base / f"{dataset_slug}_eval" / f"reference_stats_{inception_weights}.pt",
+                    base / "datasets" / f"{dataset_slug}_val_reference_stats_{inception_weights}.pt",
+                ]
+            )
+
+    resolved_root = next((str(path) for path in root_candidates if path.is_dir()), None)
+    resolved_stats = next((str(path) for path in stats_candidates if path.is_file()), None)
+    return resolved_root, resolved_stats
 
 
 # ----------------------------------------------------------------------------
@@ -613,10 +680,10 @@ def parse_int_list(s):
     default="sum",
     show_default=True,
 )
-@click.option("--learning-rate", help="Drift learning rate", type=float, default=1e-4, show_default=True)
-@click.option("--adam-beta1", help="Drift Adam/AdamW beta1", type=float, default=0.9, show_default=True)
-@click.option("--adam-beta2", help="Drift Adam/AdamW beta2", type=float, default=0.999, show_default=True)
-@click.option("--weight-decay", help="Drift optimizer weight decay", type=float, default=0.01, show_default=True)
+@click.option("--learning-rate", help="Drift learning rate", type=float, default=2e-4, show_default=True)
+@click.option("--adam-beta1", help="Drift Adam/AdamW beta1", type=float, default=0.0, show_default=True)
+@click.option("--adam-beta2", help="Drift Adam/AdamW beta2", type=float, default=0.0, show_default=True)
+@click.option("--weight-decay", help="Drift optimizer weight decay", type=float, default=0.0, show_default=True)
 @click.option(
     "--scheduler",
     help="Drift learning-rate scheduler",
@@ -638,15 +705,15 @@ def parse_int_list(s):
     default="warn",
     show_default=True,
 )
-@click.option("--patch-size", help="DiT-like patch size for drift backend", type=int, default=8, show_default=True)
+@click.option("--patch-size", help="DiT-like patch size for drift backend", type=int, default=4, show_default=True)
 @click.option("--hidden-dim", help="DiT-like hidden dimension for drift backend", type=int, default=256, show_default=True)
-@click.option("--depth", help="DiT-like depth for drift backend", type=int, default=4, show_default=True)
+@click.option("--depth", help="DiT-like depth for drift backend", type=int, default=6, show_default=True)
 @click.option("--num-heads", help="DiT-like attention heads for drift backend", type=int, default=8, show_default=True)
 @click.option("--mlp-ratio", help="DiT-like MLP ratio for drift backend", type=float, default=4.0, show_default=True)
 @click.option("--ffn-inner-dim", help="Optional explicit DiT-like FFN inner dimension", type=int, default=None)
 @click.option("--register-tokens", help="DiT-like register token count", type=int, default=16, show_default=True)
-@click.option("--style-vocab-size", help="Style vocabulary size for drift backend", type=int, default=64, show_default=True)
-@click.option("--style-token-count", help="Style token count for drift backend", type=int, default=32, show_default=True)
+@click.option("--style-vocab-size", help="Style vocabulary size for drift backend", type=int, default=1, show_default=True)
+@click.option("--style-token-count", help="Style token count for drift backend", type=int, default=0, show_default=True)
 @click.option("--alpha-hidden-dim", help="Hidden dimension for alpha embedding MLP", type=int, default=128, show_default=True)
 @click.option(
     "--norm-type",
@@ -1254,6 +1321,10 @@ def main(**kwargs):
             raise click.ClickException("--adam-beta2 must be in [0, 1)")
         if opts.weight_decay < 0:
             raise click.ClickException("--weight-decay must be non-negative")
+        if opts.style_vocab_size < 1:
+            raise click.ClickException("--style-vocab-size must be >= 1")
+        if opts.style_token_count < 0:
+            raise click.ClickException("--style-token-count must be non-negative")
         if opts.eval_every_kimg < 0:
             raise click.ClickException("--eval-every-kimg must be non-negative")
         if opts.eval_samples <= 0:
@@ -1282,6 +1353,33 @@ def main(**kwargs):
         drift_temperatures = parse_float_list(opts.drift_temperatures)
         feature_temperatures = parse_float_list(opts.feature_temperatures)
         feature_selected_stages = parse_int_list(opts.feature_selected_stages)
+        resolved_eval_every_kimg = float(opts.eval_every_kimg)
+        resolved_eval_reference_imagefolder_root = opts.eval_reference_imagefolder_root
+        resolved_eval_reference_stats_path = opts.eval_reference_stats_path
+
+        if opts.drift_backbone == "dit_like" and (len(c.metrics) > 0 or resolved_eval_every_kimg > 0.0):
+            inferred_eval_root, inferred_eval_stats = _infer_drift_periodic_eval_paths(
+                dataset_name=dataset_name,
+                data_path=opts.data,
+                inception_weights=str(opts.eval_inception_weights),
+            )
+            if resolved_eval_reference_imagefolder_root is None:
+                resolved_eval_reference_imagefolder_root = inferred_eval_root
+            if resolved_eval_reference_stats_path is None:
+                resolved_eval_reference_stats_path = inferred_eval_stats
+
+        if opts.drift_backbone == "dit_like" and len(c.metrics) > 0 and resolved_eval_every_kimg <= 0.0:
+            if resolved_eval_reference_imagefolder_root is not None:
+                resolved_eval_every_kimg = float(c.kimg_per_tick * c.network_snapshot_ticks)
+                click.echo(
+                    "NOTE: enabling drift periodic eval to mirror --metrics; "
+                    f"using --eval-every-kimg={resolved_eval_every_kimg:g}."
+                )
+            else:
+                click.echo(
+                    "NOTE: drift periodic eval was not auto-enabled because no reference imagefolder "
+                    "could be inferred. Set --eval-reference-imagefolder-root to enable eval."
+                )
 
         if opts.drift_backbone == "dit_like":
             c.G_kwargs.class_name = "training.networks.DiTLikeDriftGenerator"
@@ -1305,12 +1403,15 @@ def main(**kwargs):
             c.G_kwargs.RopeMode = opts.rope_mode
             c.G_kwargs.DisablePatchPositionalEmbedding = bool(opts.disable_patch_positional_embedding)
             c.G_kwargs.DisableRmsNormAffine = bool(opts.disable_rmsnorm_affine)
+            optimizer_class_name = "torch.optim.AdamW" if float(opts.weight_decay) > 0 else "torch.optim.Adam"
             c.G_opt_kwargs = dnnlib.EasyDict(
-                class_name="torch.optim.AdamW",
+                class_name=optimizer_class_name,
+                lr=float(opts.learning_rate),
                 betas=[float(opts.adam_beta1), float(opts.adam_beta2)],
                 eps=1e-8,
-                weight_decay=float(opts.weight_decay),
             )
+            if optimizer_class_name.endswith("AdamW"):
+                c.G_opt_kwargs.weight_decay = float(opts.weight_decay)
         else:
             c.G_kwargs.class_name = "training.networks.DriftGenerator"
             c.G_kwargs.AlphaMin = opts.alpha_min
@@ -1318,6 +1419,7 @@ def main(**kwargs):
             c.G_kwargs.EvalAlpha = opts.eval_alpha
             c.G_opt_kwargs = dnnlib.EasyDict(
                 class_name="torch.optim.Adam",
+                lr=float(opts.learning_rate),
                 betas=[0.0, 0.0],
                 eps=1e-8,
             )
@@ -1327,8 +1429,10 @@ def main(**kwargs):
         c.augment_kwargs = None
         c.aug_scheduler = None
         c.gamma_scheduler = None
-        c.lr_scheduler = None
-        c.beta2_scheduler = None
+        if opts.drift_backbone == "dit_like" and (opts.scheduler != "none" or float(opts.learning_rate) != 2e-4):
+            c.lr_scheduler = None
+        if opts.drift_backbone == "dit_like" and float(opts.adam_beta2) != 0.0:
+            c.beta2_scheduler = None
         c.negatives_per_group = opts.negatives_per_group
         c.positives_per_group = opts.positives_per_group
         c.unconditional_per_group = opts.unconditional_per_group
@@ -1420,9 +1524,9 @@ def main(**kwargs):
             save_every=int(opts.save_every),
             checkpoint_dir=opts.checkpoint_dir,
             keep_last_k_checkpoints=int(opts.keep_last_k_checkpoints),
-            eval_every_kimg=float(opts.eval_every_kimg),
-            eval_reference_imagefolder_root=opts.eval_reference_imagefolder_root,
-            eval_reference_stats_path=opts.eval_reference_stats_path,
+            eval_every_kimg=resolved_eval_every_kimg,
+            eval_reference_imagefolder_root=resolved_eval_reference_imagefolder_root,
+            eval_reference_stats_path=resolved_eval_reference_stats_path,
             eval_samples=int(opts.eval_samples),
             eval_sample_batch_size=int(opts.eval_sample_batch_size),
             eval_batch_size=int(opts.eval_batch_size),
