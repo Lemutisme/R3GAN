@@ -66,7 +66,36 @@ def training_loop(
     queue_capacity_global   = 4096,
     queue_push_batch        = 128,
     queue_warmup_batches    = 4,
+    drift_config            = None,
+    **_unused_kwargs,
 ):
+    # The shared launcher forwards the full config EasyDict to both trainers.
+    # Drift training ignores GAN-only keys such as D_kwargs and augment settings.
+    if drift_config is not None and str(getattr(drift_config, 'backbone', 'r3gan_conv')) == 'dit_like':
+        from training import drift_research
+
+        return drift_research.training_loop(
+            run_dir=run_dir,
+            training_set_kwargs=training_set_kwargs,
+            data_loader_kwargs=data_loader_kwargs,
+            G_kwargs=G_kwargs,
+            G_opt_kwargs=G_opt_kwargs,
+            metrics=metrics,
+            random_seed=random_seed,
+            num_gpus=num_gpus,
+            rank=rank,
+            batch_size=batch_size,
+            total_kimg=total_kimg,
+            kimg_per_tick=kimg_per_tick,
+            image_snapshot_ticks=image_snapshot_ticks,
+            network_snapshot_ticks=network_snapshot_ticks,
+            resume_pkl=resume_pkl,
+            cudnn_benchmark=cudnn_benchmark,
+            abort_fn=abort_fn,
+            progress_fn=progress_fn,
+            drift_config=drift_config,
+            **_unused_kwargs,
+        )
     StartTime = time.time()
     Device = torch.device('cuda', rank)
     np.random.seed(random_seed * num_gpus + rank)
@@ -550,4 +579,3 @@ def _sample_alpha(groups, alpha_min, alpha_max, device):
     if alpha_max == alpha_min:
         return torch.full([groups], float(alpha_min), device=device, dtype=torch.float32)
     return torch.rand([groups], device=device, dtype=torch.float32) * (alpha_max - alpha_min) + alpha_min
-

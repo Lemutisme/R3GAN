@@ -140,10 +140,19 @@ def launch_training(c, desc, outdir, dry_run):
     with open(os.path.join(c.run_dir, "training_options.json"), "wt") as f:
         json.dump(c, f, indent=2)
 
-    # Build fused CUDA ops once in the parent process, then spawn workers.
-    # This avoids repeated builds and surfaces environment issues early.
-    print("Prebuilding custom CUDA ops...")
-    build_custom_ops_or_die()
+    # Build fused CUDA ops once in the parent process when the selected trainer
+    # actually depends on them. The parity-oriented drift DiT backend is pure
+    # PyTorch and should not be blocked by missing local extension toolchains.
+    drift_backbone = None
+    if getattr(c, "trainer", "gan") == "drift":
+        drift_config = getattr(c, "drift_config", None)
+        if drift_config is not None:
+            drift_backbone = getattr(drift_config, "backbone", None)
+    if getattr(c, "trainer", "gan") == "drift" and drift_backbone == "dit_like":
+        print("Skipping custom CUDA op prebuild for drift/dit_like backend...")
+    else:
+        print("Prebuilding custom CUDA ops...")
+        build_custom_ops_or_die()
 
     # Launch processes.
     print("Launching processes...")
@@ -191,6 +200,14 @@ def parse_comma_separated_list(s):
     if s is None or s.lower() == "none" or s == "":
         return []
     return s.split(",")
+
+
+def parse_float_list(s):
+    return [float(x) for x in parse_comma_separated_list(s)]
+
+
+def parse_int_list(s):
+    return [int(x) for x in parse_comma_separated_list(s)]
 
 
 # ----------------------------------------------------------------------------
@@ -562,6 +579,242 @@ def parse_comma_separated_list(s):
     help="Default alpha used when sampling/evaluating a drift generator without explicit alpha",
     type=float,
     default=1.0,
+    show_default=True,
+)
+@click.option(
+    "--drift-backbone",
+    help="Drift generator backend",
+    type=click.Choice(["dit_like", "r3gan_conv"]),
+    default="dit_like",
+    show_default=True,
+)
+@click.option("--alpha-fixed", help="Fixed training alpha for drift", type=float, default=None)
+@click.option(
+    "--alpha-dist",
+    help="Alpha sampling distribution for drift training",
+    type=click.Choice(["uniform", "powerlaw", "mixture_point_powerlaw", "table8_l2_latent"]),
+    default="uniform",
+    show_default=True,
+)
+@click.option("--alpha-power", help="Power-law exponent for alpha sampling", type=float, default=3.0, show_default=True)
+@click.option("--alpha-point", help="Point-mass alpha for mixture sampling", type=float, default=1.0, show_default=True)
+@click.option("--alpha-point-prob", help="Probability of sampling alpha-point", type=float, default=0.5, show_default=True)
+@click.option(
+    "--drift-temperatures",
+    help="Comma-separated extra drift temperatures for multi-temperature raw drift",
+    type=str,
+    default="",
+    show_default=True,
+)
+@click.option(
+    "--drift-temperature-reduction",
+    help="Reduction over multiple raw drift temperatures",
+    type=click.Choice(["mean", "sum"]),
+    default="sum",
+    show_default=True,
+)
+@click.option("--learning-rate", help="Drift learning rate", type=float, default=1e-4, show_default=True)
+@click.option("--adam-beta1", help="Drift Adam/AdamW beta1", type=float, default=0.9, show_default=True)
+@click.option("--adam-beta2", help="Drift Adam/AdamW beta2", type=float, default=0.999, show_default=True)
+@click.option("--weight-decay", help="Drift optimizer weight decay", type=float, default=0.01, show_default=True)
+@click.option(
+    "--scheduler",
+    help="Drift learning-rate scheduler",
+    type=click.Choice(["none", "constant", "cosine", "warmup_cosine"]),
+    default="none",
+    show_default=True,
+)
+@click.option("--warmup-steps", help="Warmup steps for warmup_cosine drift scheduler", type=int, default=0, show_default=True)
+@click.option("--clip-grad-norm", help="Gradient clipping norm for drift training", type=float, default=2.0, show_default=True)
+@click.option("--compile-generator", help="Compile the drift generator forward", is_flag=True)
+@click.option("--compile-backend", help="torch.compile backend for generator", type=str, default="inductor", show_default=True)
+@click.option("--compile-mode", help="torch.compile mode for generator", type=str, default="reduce-overhead", show_default=True)
+@click.option("--compile-dynamic", help="Enable dynamic torch.compile for generator", is_flag=True)
+@click.option("--compile-fullgraph", help="Enable fullgraph torch.compile for generator", is_flag=True)
+@click.option(
+    "--compile-fail-action",
+    help="How drift generator compile failures are handled",
+    type=click.Choice(["warn", "raise", "disable"]),
+    default="warn",
+    show_default=True,
+)
+@click.option("--patch-size", help="DiT-like patch size for drift backend", type=int, default=8, show_default=True)
+@click.option("--hidden-dim", help="DiT-like hidden dimension for drift backend", type=int, default=256, show_default=True)
+@click.option("--depth", help="DiT-like depth for drift backend", type=int, default=4, show_default=True)
+@click.option("--num-heads", help="DiT-like attention heads for drift backend", type=int, default=8, show_default=True)
+@click.option("--mlp-ratio", help="DiT-like MLP ratio for drift backend", type=float, default=4.0, show_default=True)
+@click.option("--ffn-inner-dim", help="Optional explicit DiT-like FFN inner dimension", type=int, default=None)
+@click.option("--register-tokens", help="DiT-like register token count", type=int, default=16, show_default=True)
+@click.option("--style-vocab-size", help="Style vocabulary size for drift backend", type=int, default=64, show_default=True)
+@click.option("--style-token-count", help="Style token count for drift backend", type=int, default=32, show_default=True)
+@click.option("--alpha-hidden-dim", help="Hidden dimension for alpha embedding MLP", type=int, default=128, show_default=True)
+@click.option(
+    "--norm-type",
+    help="Normalization type for drift DiT blocks",
+    type=click.Choice(["layernorm", "rmsnorm"]),
+    default="layernorm",
+    show_default=True,
+)
+@click.option("--use-qk-norm", help="Enable QK normalization in drift DiT attention", is_flag=True)
+@click.option("--use-rope", help="Enable rotary embeddings in drift DiT attention", is_flag=True)
+@click.option(
+    "--alpha-embedding-type",
+    help="Alpha embedding type for drift DiT backend",
+    type=click.Choice(["mlp", "fourier_mlp"]),
+    default="mlp",
+    show_default=True,
+)
+@click.option(
+    "--qk-norm-mode",
+    help="QK normalization mode for drift DiT attention",
+    type=click.Choice(["auto", "none", "l2"]),
+    default="auto",
+    show_default=True,
+)
+@click.option(
+    "--rope-mode",
+    help="Rotary embedding mode for drift DiT attention",
+    type=click.Choice(["auto", "none", "1d_flat", "2d_axial"]),
+    default="auto",
+    show_default=True,
+)
+@click.option("--disable-patch-positional-embedding", help="Disable DiT patch positional embedding", is_flag=True)
+@click.option("--disable-rmsnorm-affine", help="Disable RMSNorm affine parameters in drift DiT", is_flag=True)
+@click.option("--use-feature-loss", help="Enable feature-space drift loss", is_flag=True)
+@click.option(
+    "--feature-encoder",
+    help="Feature encoder used for drift feature loss",
+    type=click.Choice(["tiny", "mae", "convnext_tiny", "convnextv2_tiny", "mae_convnextv2"]),
+    default="tiny",
+    show_default=True,
+)
+@click.option("--convnext-weights", help="Weights preset for convnext_tiny feature encoder", type=click.Choice(["none", "imagenet1k_v1"]), default="none", show_default=True)
+@click.option("--convnextv2-weights", help="Weights preset for convnextv2_tiny feature encoder", type=click.Choice(["none", "imagenet1k_v1"]), default="none", show_default=True)
+@click.option("--mae-encoder-path", help="Optional MAE encoder checkpoint for drift feature loss", type=str, default=None)
+@click.option(
+    "--mae-encoder-arch",
+    help="MAE encoder architecture for drift feature loss",
+    type=click.Choice(["resnet_unet", "legacy_conv", "paper_resnet34_unet"]),
+    default="resnet_unet",
+    show_default=True,
+)
+@click.option("--mae-input-patchify-size", help="MAE input patchify size", type=int, default=1, show_default=True)
+@click.option("--feature-base-channels", help="Base channels for tiny/MAE feature encoders", type=int, default=16, show_default=True)
+@click.option("--feature-stages", help="Number of stages for tiny/MAE feature encoders", type=int, default=3, show_default=True)
+@click.option(
+    "--feature-temperatures",
+    help="Comma-separated feature drift temperatures",
+    type=str,
+    default="0.02,0.05,0.2",
+    show_default=True,
+)
+@click.option(
+    "--feature-temperature-aggregation",
+    help="How to aggregate feature drift temperatures",
+    type=click.Choice(["per_temperature_mse", "sum_drifts_then_mse"]),
+    default="sum_drifts_then_mse",
+    show_default=True,
+)
+@click.option(
+    "--feature-loss-term-reduction",
+    help="Reduction over feature loss terms",
+    type=click.Choice(["sum", "mean"]),
+    default="sum",
+    show_default=True,
+)
+@click.option(
+    "--feature-selected-stages",
+    help="Comma-separated selected feature stages; empty means all",
+    type=str,
+    default="",
+    show_default=True,
+)
+@click.option("--include-patch4-stats", help="Include patch4 feature vector statistics", is_flag=True)
+@click.option("--include-input-x2-mean", help="Include input x2 mean feature statistics", is_flag=True)
+@click.option("--disable-shared-location-normalization", help="Disable shared location normalization for feature loss", is_flag=True)
+@click.option("--disable-feature-temperature-sqrt-scaling", help="Disable sqrt(channel) scaling for feature temperatures", is_flag=True)
+@click.option("--feature-include-raw-drift-loss", help="Mix raw pixel drift into feature loss", is_flag=True)
+@click.option("--feature-raw-drift-loss-weight", help="Weight for raw drift loss mixed into feature loss", type=float, default=1.0, show_default=True)
+@click.option("--feature-compile-drift-kernel", help="Compile the feature drift kernel", is_flag=True)
+@click.option("--feature-compile-backend", help="torch.compile backend for feature drift kernel", type=str, default="inductor", show_default=True)
+@click.option("--feature-compile-mode", help="torch.compile mode for feature drift kernel", type=str, default="reduce-overhead", show_default=True)
+@click.option("--feature-compile-dynamic", help="Enable dynamic torch.compile for feature drift kernel", is_flag=True)
+@click.option("--feature-compile-fullgraph", help="Enable fullgraph torch.compile for feature drift kernel", is_flag=True)
+@click.option(
+    "--feature-compile-fail-action",
+    help="How feature drift compile failures are handled",
+    type=click.Choice(["warn", "raise"]),
+    default="warn",
+    show_default=True,
+)
+@click.option("--queue-prime-samples", help="Real samples used to warm the drift queue", type=int, default=200, show_default=True)
+@click.option(
+    "--queue-warmup-mode",
+    help="Drift queue warmup mode",
+    type=click.Choice(["random", "class_balanced"]),
+    default="random",
+    show_default=True,
+)
+@click.option("--queue-warmup-min-per-class", help="Minimum per-class count for class_balanced warmup", type=int, default=1, show_default=True)
+@click.option("--queue-strict-without-replacement", help="Disallow queue sampling with replacement", is_flag=True)
+@click.option(
+    "--queue-refill-policy",
+    help="Queue refill policy during drift training",
+    type=click.Choice(["per_step", "every_n_steps"]),
+    default="per_step",
+    show_default=True,
+)
+@click.option("--queue-refill-every", help="Number of steps between queue refills when using every_n_steps", type=int, default=1, show_default=True)
+@click.option(
+    "--queue-report-level",
+    help="Queue report detail level",
+    type=click.Choice(["basic", "full"]),
+    default="basic",
+    show_default=True,
+)
+@click.option(
+    "--real-batch-source",
+    help="Source used for drift real batches",
+    type=click.Choice(["dataset_loader", "synthetic_dataset", "imagefolder", "tensor_file", "tensor_shards", "webdataset"]),
+    default="dataset_loader",
+    show_default=True,
+)
+@click.option("--real-dataset-size", help="Synthetic drift real dataset size", type=int, default=4096, show_default=True)
+@click.option("--real-loader-batch-size", help="Batch size for real-batch provider", type=int, default=128, show_default=True)
+@click.option("--real-num-workers", help="Worker count for real-batch provider", type=int, default=0, show_default=True)
+@click.option("--disable-real-shuffle", help="Disable shuffling in real-batch provider", is_flag=True)
+@click.option("--real-pin-memory", help="Enable pin_memory in real-batch provider", is_flag=True)
+@click.option("--real-persistent-workers", help="Enable persistent workers in real-batch provider", is_flag=True)
+@click.option("--real-prefetch-factor", help="Prefetch factor for real-batch provider", type=int, default=0, show_default=True)
+@click.option("--real-sanity-sample-batches", help="Sample this many batches to build a real-provider sanity report", type=int, default=0, show_default=True)
+@click.option("--real-imagefolder-root", help="ImageFolder root for drift real-batch provider", type=str, default=None)
+@click.option("--real-webdataset-urls", help="WebDataset URL(s) for drift real-batch provider", type=str, default=None)
+@click.option("--real-tensor-file-path", help="Tensor file path for drift real-batch provider", type=str, default=None)
+@click.option("--real-tensor-shards-manifest-path", help="Tensor shards manifest path for drift real-batch provider", type=str, default=None)
+@click.option("--real-transform-resize", help="Resize for imagefolder real-batch provider", type=int, default=None)
+@click.option("--disable-real-center-crop", help="Disable center crop in imagefolder real-batch provider", is_flag=True)
+@click.option("--real-horizontal-flip", help="Enable horizontal flip in imagefolder real-batch provider", is_flag=True)
+@click.option("--real-transform-normalize", help="Normalize imagefolder real batches to [0,1]", is_flag=True)
+@click.option("--resume-model-only", help="Load only model weights from a drift checkpoint", is_flag=True)
+@click.option("--resume-reset-scheduler", help="Reset drift scheduler state on resume", is_flag=True)
+@click.option("--resume-reset-optimizer-lr", help="Reset drift optimizer LR on resume", is_flag=True)
+@click.option("--allow-resume-config-mismatch", help="Allow drift checkpoint config hash mismatch", is_flag=True)
+@click.option("--save-every", help="Save a research checkpoint every N steps; 0 disables", type=int, default=0, show_default=True)
+@click.option("--checkpoint-dir", help="Directory for drift checkpoints; defaults under run dir", type=str, default=None)
+@click.option("--keep-last-k-checkpoints", help="Keep only the latest K drift checkpoints; 0 keeps all", type=int, default=0, show_default=True)
+@click.option("--eval-every-kimg", help="Run reference-style periodic eval every N kimg; 0 disables", type=float, default=0.0, show_default=True)
+@click.option("--eval-reference-imagefolder-root", help="Reference image folder used to build eval stats", type=str, default=None)
+@click.option("--eval-reference-stats-path", help="Reference stats path for drift periodic eval", type=str, default=None)
+@click.option("--eval-samples", help="Generated sample count for each periodic eval", type=int, default=50000, show_default=True)
+@click.option("--eval-sample-batch-size", help="Generator batch size used during periodic eval sampling", type=int, default=128, show_default=True)
+@click.option("--eval-batch-size", help="Batch size used when building reference eval stats", type=int, default=128, show_default=True)
+@click.option("--eval-num-workers", help="Worker count used during periodic eval", type=int, default=0, show_default=True)
+@click.option("--eval-inception-weights", help="Inception weights preset for periodic eval", type=click.Choice(["pretrained", "none"]), default="pretrained", show_default=True)
+@click.option(
+    "--eval-postprocess-mode",
+    help="Postprocess mode for periodic eval samples",
+    type=click.Choice(["clamp_0_1", "tanh_to_0_1", "sigmoid", "identity"]),
+    default="clamp_0_1",
     show_default=True,
 )
 # Misc settings.
@@ -967,20 +1220,48 @@ def main(**kwargs):
             raise click.ClickException("--trainer=drift requires --cond=1")
         if not c.training_set_kwargs.use_labels:
             raise click.ClickException("--trainer=drift requires a labeled dataset")
+        if opts.alpha_fixed is not None and opts.alpha_fixed < 1.0:
+            raise click.ClickException("--alpha-fixed must be >= 1.0")
         if opts.alpha_min < 1.0:
             raise click.ClickException("--alpha-min must be >= 1.0")
         if opts.alpha_max < opts.alpha_min:
             raise click.ClickException("--alpha-max must be >= --alpha-min")
+        if not 0.0 <= opts.alpha_point_prob <= 1.0:
+            raise click.ClickException("--alpha-point-prob must be in [0, 1]")
         if opts.eval_alpha <= 0:
             raise click.ClickException("--eval-alpha must be positive")
         if opts.drift_temperature <= 0:
             raise click.ClickException("--drift-temperature must be positive")
+        if opts.clip_grad_norm <= 0:
+            raise click.ClickException("--clip-grad-norm must be positive")
         if c.batch_size % (c.num_gpus * opts.negatives_per_group) != 0:
             raise click.ClickException(
                 "--batch / --gpus must be divisible by --negatives-per-group for drift training"
             )
         if opts.queue_push_batch % c.num_gpus != 0:
             raise click.ClickException("--queue-push-batch must be divisible by --gpus")
+        if opts.queue_warmup_min_per_class <= 0:
+            raise click.ClickException("--queue-warmup-min-per-class must be positive")
+        if opts.queue_refill_every <= 0:
+            raise click.ClickException("--queue-refill-every must be positive")
+        if opts.real_loader_batch_size <= 0:
+            raise click.ClickException("--real-loader-batch-size must be positive")
+        if opts.learning_rate <= 0:
+            raise click.ClickException("--learning-rate must be positive")
+        if opts.adam_beta1 < 0 or opts.adam_beta1 >= 1:
+            raise click.ClickException("--adam-beta1 must be in [0, 1)")
+        if opts.adam_beta2 < 0 or opts.adam_beta2 >= 1:
+            raise click.ClickException("--adam-beta2 must be in [0, 1)")
+        if opts.weight_decay < 0:
+            raise click.ClickException("--weight-decay must be non-negative")
+        if opts.eval_every_kimg < 0:
+            raise click.ClickException("--eval-every-kimg must be non-negative")
+        if opts.eval_samples <= 0:
+            raise click.ClickException("--eval-samples must be positive")
+        if opts.eval_sample_batch_size <= 0 or opts.eval_batch_size <= 0:
+            raise click.ClickException("--eval-sample-batch-size and --eval-batch-size must be positive")
+        if opts.feature_raw_drift_loss_weight < 0:
+            raise click.ClickException("--feature-raw-drift-loss-weight must be non-negative")
 
         if opts.aug:
             click.echo("NOTE: --aug is ignored for --trainer=drift.")
@@ -998,16 +1279,56 @@ def main(**kwargs):
         ):
             click.echo("NOTE: adversarial and discriminator-side ranking options are ignored for --trainer=drift.")
 
-        c.G_kwargs.class_name = "training.networks.DriftGenerator"
-        c.G_kwargs.AlphaMin = opts.alpha_min
-        c.G_kwargs.AlphaMax = opts.alpha_max
-        c.G_kwargs.EvalAlpha = opts.eval_alpha
+        drift_temperatures = parse_float_list(opts.drift_temperatures)
+        feature_temperatures = parse_float_list(opts.feature_temperatures)
+        feature_selected_stages = parse_int_list(opts.feature_selected_stages)
+
+        if opts.drift_backbone == "dit_like":
+            c.G_kwargs.class_name = "training.networks.DiTLikeDriftGenerator"
+            c.G_kwargs.ImageChannels = 3
+            c.G_kwargs.EvalAlpha = opts.eval_alpha
+            c.G_kwargs.PatchSize = opts.patch_size
+            c.G_kwargs.HiddenDim = opts.hidden_dim
+            c.G_kwargs.Depth = opts.depth
+            c.G_kwargs.NumHeads = opts.num_heads
+            c.G_kwargs.MlpRatio = opts.mlp_ratio
+            c.G_kwargs.FfnInnerDim = opts.ffn_inner_dim
+            c.G_kwargs.RegisterTokens = opts.register_tokens
+            c.G_kwargs.StyleVocabSize = opts.style_vocab_size
+            c.G_kwargs.StyleTokenCount = opts.style_token_count
+            c.G_kwargs.AlphaHiddenDim = opts.alpha_hidden_dim
+            c.G_kwargs.NormType = opts.norm_type
+            c.G_kwargs.UseQkNorm = bool(opts.use_qk_norm)
+            c.G_kwargs.UseRope = bool(opts.use_rope)
+            c.G_kwargs.AlphaEmbeddingType = opts.alpha_embedding_type
+            c.G_kwargs.QkNormMode = opts.qk_norm_mode
+            c.G_kwargs.RopeMode = opts.rope_mode
+            c.G_kwargs.DisablePatchPositionalEmbedding = bool(opts.disable_patch_positional_embedding)
+            c.G_kwargs.DisableRmsNormAffine = bool(opts.disable_rmsnorm_affine)
+            c.G_opt_kwargs = dnnlib.EasyDict(
+                class_name="torch.optim.AdamW",
+                betas=[float(opts.adam_beta1), float(opts.adam_beta2)],
+                eps=1e-8,
+                weight_decay=float(opts.weight_decay),
+            )
+        else:
+            c.G_kwargs.class_name = "training.networks.DriftGenerator"
+            c.G_kwargs.AlphaMin = opts.alpha_min
+            c.G_kwargs.AlphaMax = opts.alpha_max
+            c.G_kwargs.EvalAlpha = opts.eval_alpha
+            c.G_opt_kwargs = dnnlib.EasyDict(
+                class_name="torch.optim.Adam",
+                betas=[0.0, 0.0],
+                eps=1e-8,
+            )
         c.D_kwargs = None
         c.D_opt_kwargs = None
         c.loss_kwargs = dnnlib.EasyDict()
         c.augment_kwargs = None
         c.aug_scheduler = None
         c.gamma_scheduler = None
+        c.lr_scheduler = None
+        c.beta2_scheduler = None
         c.negatives_per_group = opts.negatives_per_group
         c.positives_per_group = opts.positives_per_group
         c.unconditional_per_group = opts.unconditional_per_group
@@ -1018,8 +1339,119 @@ def main(**kwargs):
         c.queue_capacity_global = opts.queue_capacity_global
         c.queue_push_batch = opts.queue_push_batch
         c.queue_warmup_batches = opts.queue_warmup_batches
+        c.drift_config = dnnlib.EasyDict(
+            backbone=opts.drift_backbone,
+            alpha_fixed=opts.alpha_fixed,
+            alpha_min=float(opts.alpha_min),
+            alpha_max=float(opts.alpha_max),
+            alpha_dist=opts.alpha_dist,
+            alpha_power=float(opts.alpha_power),
+            alpha_point=float(opts.alpha_point),
+            alpha_point_prob=float(opts.alpha_point_prob),
+            drift_temperature=float(opts.drift_temperature),
+            drift_temperatures=drift_temperatures,
+            drift_temperature_reduction=opts.drift_temperature_reduction,
+            learning_rate=float(opts.learning_rate),
+            adam_beta1=float(opts.adam_beta1),
+            adam_beta2=float(opts.adam_beta2),
+            weight_decay=float(opts.weight_decay),
+            scheduler=opts.scheduler,
+            warmup_steps=int(opts.warmup_steps),
+            clip_grad_norm=float(opts.clip_grad_norm),
+            compile_generator=bool(opts.compile_generator),
+            compile_backend=str(opts.compile_backend),
+            compile_mode=str(opts.compile_mode),
+            compile_dynamic=bool(opts.compile_dynamic),
+            compile_fullgraph=bool(opts.compile_fullgraph),
+            compile_fail_action=str(opts.compile_fail_action),
+            use_feature_loss=bool(opts.use_feature_loss),
+            feature_encoder=str(opts.feature_encoder),
+            convnext_weights=str(opts.convnext_weights),
+            convnextv2_weights=str(opts.convnextv2_weights),
+            mae_encoder_path=opts.mae_encoder_path,
+            mae_encoder_arch=str(opts.mae_encoder_arch),
+            mae_input_patchify_size=int(opts.mae_input_patchify_size),
+            feature_base_channels=int(opts.feature_base_channels),
+            feature_stages=int(opts.feature_stages),
+            feature_temperatures=feature_temperatures,
+            feature_temperature_aggregation=str(opts.feature_temperature_aggregation),
+            feature_loss_term_reduction=str(opts.feature_loss_term_reduction),
+            feature_selected_stages=feature_selected_stages,
+            include_patch4_stats=bool(opts.include_patch4_stats),
+            include_input_x2_mean=bool(opts.include_input_x2_mean),
+            disable_shared_location_normalization=bool(opts.disable_shared_location_normalization),
+            disable_feature_temperature_sqrt_scaling=bool(opts.disable_feature_temperature_sqrt_scaling),
+            feature_include_raw_drift_loss=bool(opts.feature_include_raw_drift_loss),
+            feature_raw_drift_loss_weight=float(opts.feature_raw_drift_loss_weight),
+            feature_compile_drift_kernel=bool(opts.feature_compile_drift_kernel),
+            feature_compile_backend=str(opts.feature_compile_backend),
+            feature_compile_mode=str(opts.feature_compile_mode),
+            feature_compile_dynamic=bool(opts.feature_compile_dynamic),
+            feature_compile_fullgraph=bool(opts.feature_compile_fullgraph),
+            feature_compile_fail_action=str(opts.feature_compile_fail_action),
+            queue_prime_samples=int(opts.queue_prime_samples),
+            queue_warmup_mode=str(opts.queue_warmup_mode),
+            queue_warmup_min_per_class=int(opts.queue_warmup_min_per_class),
+            queue_strict_without_replacement=bool(opts.queue_strict_without_replacement),
+            queue_refill_policy=str(opts.queue_refill_policy),
+            queue_refill_every=int(opts.queue_refill_every),
+            queue_report_level=str(opts.queue_report_level),
+            real_batch_source=str(opts.real_batch_source),
+            real_dataset_size=int(opts.real_dataset_size),
+            real_loader_batch_size=int(opts.real_loader_batch_size),
+            real_num_workers=int(opts.real_num_workers),
+            disable_real_shuffle=bool(opts.disable_real_shuffle),
+            real_pin_memory=bool(opts.real_pin_memory),
+            real_persistent_workers=bool(opts.real_persistent_workers),
+            real_prefetch_factor=int(opts.real_prefetch_factor),
+            real_sanity_sample_batches=int(opts.real_sanity_sample_batches),
+            real_imagefolder_root=opts.real_imagefolder_root,
+            real_webdataset_urls=opts.real_webdataset_urls,
+            real_tensor_file_path=opts.real_tensor_file_path,
+            real_tensor_shards_manifest_path=opts.real_tensor_shards_manifest_path,
+            real_transform_resize=opts.real_transform_resize,
+            disable_real_center_crop=bool(opts.disable_real_center_crop),
+            real_horizontal_flip=bool(opts.real_horizontal_flip),
+            real_transform_normalize=bool(opts.real_transform_normalize),
+            resume_model_only=bool(opts.resume_model_only),
+            resume_reset_scheduler=bool(opts.resume_reset_scheduler),
+            resume_reset_optimizer_lr=bool(opts.resume_reset_optimizer_lr),
+            allow_resume_config_mismatch=bool(opts.allow_resume_config_mismatch),
+            save_every=int(opts.save_every),
+            checkpoint_dir=opts.checkpoint_dir,
+            keep_last_k_checkpoints=int(opts.keep_last_k_checkpoints),
+            eval_every_kimg=float(opts.eval_every_kimg),
+            eval_reference_imagefolder_root=opts.eval_reference_imagefolder_root,
+            eval_reference_stats_path=opts.eval_reference_stats_path,
+            eval_samples=int(opts.eval_samples),
+            eval_sample_batch_size=int(opts.eval_sample_batch_size),
+            eval_batch_size=int(opts.eval_batch_size),
+            eval_num_workers=int(opts.eval_num_workers),
+            eval_inception_weights=str(opts.eval_inception_weights),
+            eval_postprocess_mode=str(opts.eval_postprocess_mode),
+            eval_alpha=float(opts.eval_alpha),
+            patch_size=int(opts.patch_size),
+            hidden_dim=int(opts.hidden_dim),
+            depth=int(opts.depth),
+            num_heads=int(opts.num_heads),
+            mlp_ratio=float(opts.mlp_ratio),
+            ffn_inner_dim=opts.ffn_inner_dim,
+            register_tokens=int(opts.register_tokens),
+            style_vocab_size=int(opts.style_vocab_size),
+            style_token_count=int(opts.style_token_count),
+            alpha_hidden_dim=int(opts.alpha_hidden_dim),
+            norm_type=str(opts.norm_type),
+            use_qk_norm=bool(opts.use_qk_norm),
+            use_rope=bool(opts.use_rope),
+            alpha_embedding_type=str(opts.alpha_embedding_type),
+            qk_norm_mode=str(opts.qk_norm_mode),
+            rope_mode=str(opts.rope_mode),
+            disable_patch_positional_embedding=bool(opts.disable_patch_positional_embedding),
+            disable_rmsnorm_affine=bool(opts.disable_rmsnorm_affine),
+        )
 
         desc = f"{dataset_name:s}-drift-gpus{c.num_gpus:d}-batch{c.batch_size:d}"
+        desc += f"-{opts.drift_backbone}"
         desc += f"-neg{opts.negatives_per_group:d}-pos{opts.positives_per_group:d}"
         desc += f"-alpha{opts.alpha_min:g}to{opts.alpha_max:g}"
         if opts.desc is not None:

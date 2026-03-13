@@ -1,7 +1,14 @@
 import io
+import inspect
+import os
 import pickle
+import sys
 import unittest
 from unittest import mock
+
+REFERENCE_DRIFT_ROOT = "/workspace/drift_models"
+if os.path.isdir(REFERENCE_DRIFT_ROOT) and REFERENCE_DRIFT_ROOT not in sys.path:
+    sys.path.insert(0, REFERENCE_DRIFT_ROOT)
 
 try:
     import dnnlib
@@ -16,6 +23,7 @@ if torch is not None:
     import legacy
     import train as train_cli
     from training import networks as training_networks
+    from training import drift_training_loop as drift_training_loop_impl
     from training.drift_loss import (
         DriftLossConfig,
         build_negative_log_weights,
@@ -28,10 +36,24 @@ if torch is not None:
         QueueConfig,
         ensure_class_coverage,
     )
+    try:
+        from drifting_models.drift_field import DriftFieldConfig as ReferenceDriftFieldConfig
+        from drifting_models.drift_loss import (
+            DriftingLossConfig as ReferenceDriftingLossConfig,
+            drifting_stopgrad_loss as reference_drifting_stopgrad_loss,
+        )
+    except Exception:  # pragma: no cover
+        ReferenceDriftFieldConfig = None
+        ReferenceDriftingLossConfig = None
+        reference_drifting_stopgrad_loss = None
 else:  # pragma: no cover
     legacy = None
     train_cli = None
     training_networks = None
+    drift_training_loop_impl = None
+    ReferenceDriftFieldConfig = None
+    ReferenceDriftingLossConfig = None
+    reference_drifting_stopgrad_loss = None
 
 
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
@@ -89,6 +111,83 @@ class TestDriftLoss(unittest.TestCase):
         reference_norm = sum(scalar_norms) / len(scalar_norms)
         self.assertTrue(torch.allclose(grouped_loss.detach(), reference_loss, atol=1e-6))
         self.assertAlmostEqual(grouped_stats["mean_drift_norm"], reference_norm, places=6)
+
+    @unittest.skipIf(
+        reference_drifting_stopgrad_loss is None or ReferenceDriftFieldConfig is None or ReferenceDriftingLossConfig is None,
+        "Reference drift_models package is not available",
+    )
+    def test_scalar_loss_matches_reference_drift_models(self):
+        torch.manual_seed(13)
+        x = torch.randn(4, 3 * 4 * 4)
+        y_pos = torch.randn(5, 3 * 4 * 4)
+        y_unc = torch.randn(2, 3 * 4 * 4)
+        y_neg = torch.cat([x, y_unc], dim=0)
+        negative_log_weights = build_negative_log_weights(
+            n_generated_negatives=x.shape[0],
+            n_unconditional_negatives=y_unc.shape[0],
+            unconditional_weight=1.75,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        ours_loss, ours_drift, ours_stats = drifting_stopgrad_loss(
+            x=x,
+            y_pos=y_pos,
+            y_neg=y_neg,
+            config=DriftLossConfig(temperature=0.07),
+            negative_log_weights=negative_log_weights,
+            generated_negative_count=x.shape[0],
+        )
+
+        reference_loss, reference_drift, reference_stats = reference_drifting_stopgrad_loss(
+            x=x,
+            y_pos=y_pos,
+            y_neg=y_neg,
+            config=ReferenceDriftingLossConfig(
+                drift_field=ReferenceDriftFieldConfig(
+                    temperature=0.07,
+                    normalize_over_x=True,
+                    mask_self_negatives=True,
+                    self_mask_value=1e6,
+                    eps=1e-12,
+                ),
+                attraction_scale=1.0,
+                repulsion_scale=1.0,
+                stopgrad_target=True,
+            ),
+            negative_log_weights=negative_log_weights,
+            generated_negative_count=x.shape[0],
+        )
+
+        self.assertTrue(torch.allclose(ours_loss.detach(), reference_loss.detach(), atol=1e-6))
+        self.assertTrue(torch.allclose(ours_drift.detach(), reference_drift.detach(), atol=1e-6))
+        self.assertAlmostEqual(ours_stats["drift_norm"], reference_stats["drift_norm"], places=6)
+
+
+@unittest.skipIf(torch is None or drift_training_loop_impl is None, "Drift training loop is not available")
+class TestDriftTrainingLoopCompatibility(unittest.TestCase):
+    def test_training_loop_accepts_gan_side_kwargs_without_typeerror(self):
+        signature = inspect.signature(drift_training_loop_impl.training_loop)
+        self.assertTrue(
+            any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+        )
+
+        with mock.patch.object(
+            drift_training_loop_impl.dnnlib.util,
+            "construct_class_by_name",
+            side_effect=RuntimeError("sentinel"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "sentinel"):
+                drift_training_loop_impl.training_loop(
+                    training_set_kwargs={},
+                    data_loader_kwargs={},
+                    G_kwargs={},
+                    G_opt_kwargs={},
+                    D_kwargs=None,
+                    D_opt_kwargs=None,
+                    loss_kwargs={},
+                    augment_kwargs=None,
+                )
 
 
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
@@ -186,6 +285,32 @@ class TestDriftGenerator(unittest.TestCase):
         self.assertTrue(torch.allclose(out_default, out_explicit))
         self.assertTrue(torch.allclose(inner.last_condition[:, -1], torch.full([2], 0.5)))
 
+    def test_dit_like_generator_accepts_one_hot_labels_and_eval_alpha(self):
+        generator = training_networks.DiTLikeDriftGenerator(
+            FP16Stages=[],
+            c_dim=3,
+            img_resolution=8,
+            ImageChannels=3,
+            PatchSize=4,
+            HiddenDim=32,
+            Depth=2,
+            NumHeads=4,
+            RegisterTokens=2,
+            StyleTokenCount=3,
+            StyleVocabSize=7,
+            EvalAlpha=1.5,
+        )
+
+        noise = torch.randn(2, 3, 8, 8)
+        one_hot = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        class_ids = torch.tensor([0, 1], dtype=torch.long)
+        style_indices = torch.zeros(2, 3, dtype=torch.long)
+
+        out_default = generator(noise, one_hot)
+        out_explicit = generator(noise, class_ids, alpha=torch.full([2], 1.5), style_indices=style_indices)
+        self.assertEqual(out_default.shape, (2, 3, 8, 8))
+        self.assertTrue(torch.allclose(out_default, out_explicit, atol=1e-6))
+
 
 @unittest.skipIf(torch is None, "PyTorch is not available in this environment")
 class TestDriftLegacyCompatibility(unittest.TestCase):
@@ -260,11 +385,14 @@ class TestDriftCliMappings(unittest.TestCase):
         kwargs = launch_training.call_args.kwargs
         config = kwargs["c"]
         self.assertEqual(config.trainer, "drift")
-        self.assertEqual(config.G_kwargs.class_name, "training.networks.DriftGenerator")
+        self.assertEqual(config.G_kwargs.class_name, "training.networks.DiTLikeDriftGenerator")
         self.assertEqual(config.negatives_per_group, 2)
         self.assertEqual(config.positives_per_group, 3)
         self.assertEqual(config.unconditional_per_group, 1)
-        self.assertEqual(config.G_kwargs.AlphaMax, 3.0)
+        self.assertEqual(config.G_kwargs.HiddenDim, 256)
+        self.assertEqual(config.drift_config.backbone, "dit_like")
+        self.assertEqual(config.drift_config.alpha_max, 3.0)
+        self.assertEqual(config.G_opt_kwargs.class_name, "torch.optim.AdamW")
         self.assertIsNone(config.D_kwargs)
 
     def test_drift_cli_requires_conditional_labels(self):
@@ -272,3 +400,15 @@ class TestDriftCliMappings(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("--trainer=drift requires --cond=1", result.output)
 
+    def test_drift_cli_can_select_r3gan_conv_backbone(self):
+        result, launch_training = self._invoke_train(
+            [
+                "--trainer=drift",
+                "--cond=1",
+                "--drift-backbone=r3gan_conv",
+            ]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        config = launch_training.call_args.kwargs["c"]
+        self.assertEqual(config.G_kwargs.class_name, "training.networks.DriftGenerator")
+        self.assertEqual(config.drift_config.backbone, "r3gan_conv")
