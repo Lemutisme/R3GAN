@@ -55,7 +55,12 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = "none"
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **c)
+    if getattr(c, "trainer", "gan") == "drift":
+        from training import drift_training_loop
+
+        drift_training_loop.training_loop(rank=rank, **c)
+    else:
+        training_loop.training_loop(rank=rank, **c)
 
 
 # ----------------------------------------------------------------------------
@@ -214,6 +219,13 @@ def parse_comma_separated_list(s):
     required=True,
 )
 @click.option("--preset", help="Preset configs", metavar="STR", type=str, required=True)
+@click.option(
+    "--trainer",
+    help="Training mode",
+    type=click.Choice(["gan", "drift"]),
+    default="gan",
+    show_default=True,
+)
 # Optional features.
 @click.option(
     "--cond",
@@ -468,6 +480,90 @@ def parse_comma_separated_list(s):
     metavar="INT",
     type=click.IntRange(min=1),
 )
+@click.option(
+    "--negatives-per-group",
+    help="Generated negatives per drift group",
+    metavar="INT",
+    type=click.IntRange(min=2),
+    default=4,
+    show_default=True,
+)
+@click.option(
+    "--positives-per-group",
+    help="Positive real samples per drift group",
+    metavar="INT",
+    type=click.IntRange(min=1),
+    default=4,
+    show_default=True,
+)
+@click.option(
+    "--unconditional-per-group",
+    help="Unconditional real negatives per drift group",
+    metavar="INT",
+    type=click.IntRange(min=1),
+    default=2,
+    show_default=True,
+)
+@click.option(
+    "--alpha-min",
+    help="Minimum alpha for drift CFG weighting",
+    type=float,
+    default=1.0,
+    show_default=True,
+)
+@click.option(
+    "--alpha-max",
+    help="Maximum alpha for drift CFG weighting",
+    type=float,
+    default=4.0,
+    show_default=True,
+)
+@click.option(
+    "--queue-capacity-per-class",
+    help="Per-class drift queue capacity",
+    metavar="INT",
+    type=click.IntRange(min=1),
+    default=256,
+    show_default=True,
+)
+@click.option(
+    "--queue-capacity-global",
+    help="Global drift queue capacity",
+    metavar="INT",
+    type=click.IntRange(min=1),
+    default=4096,
+    show_default=True,
+)
+@click.option(
+    "--queue-push-batch",
+    help="Total real samples pushed into the drift queue per step",
+    metavar="INT",
+    type=click.IntRange(min=1),
+    default=128,
+    show_default=True,
+)
+@click.option(
+    "--queue-warmup-batches",
+    help="Number of queue warmup batches before drift training starts",
+    metavar="INT",
+    type=click.IntRange(min=0),
+    default=4,
+    show_default=True,
+)
+@click.option(
+    "--drift-temperature",
+    help="Temperature for pixel-space drift affinity",
+    type=float,
+    default=0.05,
+    show_default=True,
+)
+@click.option(
+    "--eval-alpha",
+    help="Default alpha used when sampling/evaluating a drift generator without explicit alpha",
+    type=float,
+    default=1.0,
+    show_default=True,
+)
 # Misc settings.
 @click.option(
     "--desc", help="String to include in result dir name", metavar="STR", type=str
@@ -508,7 +604,7 @@ def parse_comma_separated_list(s):
     "--snapshot-policy",
     help="Snapshot retention policy",
     type=click.Choice(["all", "latest-best"]),
-    default="all",
+    default="latest-best",
     show_default=True,
 )
 @click.option(
@@ -793,6 +889,7 @@ def main(**kwargs):
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.snapshot_policy = opts.snapshot_policy
+    c.trainer = opts.trainer
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
@@ -864,6 +961,72 @@ def main(**kwargs):
     # Performance-related toggles.
     if opts.nobench:
         c.cudnn_benchmark = False
+
+    if opts.trainer == "drift":
+        if not opts.cond:
+            raise click.ClickException("--trainer=drift requires --cond=1")
+        if not c.training_set_kwargs.use_labels:
+            raise click.ClickException("--trainer=drift requires a labeled dataset")
+        if opts.alpha_min < 1.0:
+            raise click.ClickException("--alpha-min must be >= 1.0")
+        if opts.alpha_max < opts.alpha_min:
+            raise click.ClickException("--alpha-max must be >= --alpha-min")
+        if opts.eval_alpha <= 0:
+            raise click.ClickException("--eval-alpha must be positive")
+        if opts.drift_temperature <= 0:
+            raise click.ClickException("--drift-temperature must be positive")
+        if c.batch_size % (c.num_gpus * opts.negatives_per_group) != 0:
+            raise click.ClickException(
+                "--batch / --gpus must be divisible by --negatives-per-group for drift training"
+            )
+        if opts.queue_push_batch % c.num_gpus != 0:
+            raise click.ClickException("--queue-push-batch must be divisible by --gpus")
+
+        if opts.aug:
+            click.echo("NOTE: --aug is ignored for --trainer=drift.")
+        if opts.disable_r1 or opts.disable_r2 or opts.non_aug_gp:
+            click.echo("NOTE: R1/R2 and non-aug GP flags are ignored for --trainer=drift.")
+        if (
+            opts.lambda_pair is not None
+            or opts.pair_margin is not None
+            or opts.lambda_list is not None
+            or opts.list_tau is not None
+            or opts.lambda_local_rank != 0.0
+            or opts.coupling_k != 0
+            or opts.path_rank_reg
+            or opts.rank_loss
+        ):
+            click.echo("NOTE: adversarial and discriminator-side ranking options are ignored for --trainer=drift.")
+
+        c.G_kwargs.class_name = "training.networks.DriftGenerator"
+        c.G_kwargs.AlphaMin = opts.alpha_min
+        c.G_kwargs.AlphaMax = opts.alpha_max
+        c.G_kwargs.EvalAlpha = opts.eval_alpha
+        c.D_kwargs = None
+        c.D_opt_kwargs = None
+        c.loss_kwargs = dnnlib.EasyDict()
+        c.augment_kwargs = None
+        c.aug_scheduler = None
+        c.gamma_scheduler = None
+        c.negatives_per_group = opts.negatives_per_group
+        c.positives_per_group = opts.positives_per_group
+        c.unconditional_per_group = opts.unconditional_per_group
+        c.alpha_min = opts.alpha_min
+        c.alpha_max = opts.alpha_max
+        c.drift_temperature = opts.drift_temperature
+        c.queue_capacity_per_class = opts.queue_capacity_per_class
+        c.queue_capacity_global = opts.queue_capacity_global
+        c.queue_push_batch = opts.queue_push_batch
+        c.queue_warmup_batches = opts.queue_warmup_batches
+
+        desc = f"{dataset_name:s}-drift-gpus{c.num_gpus:d}-batch{c.batch_size:d}"
+        desc += f"-neg{opts.negatives_per_group:d}-pos{opts.positives_per_group:d}"
+        desc += f"-alpha{opts.alpha_min:g}to{opts.alpha_max:g}"
+        if opts.desc is not None:
+            desc += f"-{opts.desc}"
+
+        launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
+        return
 
     # Description string.
     desc = f"{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}"

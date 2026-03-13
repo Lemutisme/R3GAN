@@ -422,12 +422,25 @@ def training_loop(
         cur_ema_nimg = cosine_decay_with_warmup(cur_nimg, **ema_scheduler)
         cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
 
+        cur_list_d = float(getattr(loss, "lambda_list_d", getattr(loss, "lambda_list", 0.0)))
+        cur_list_g = float(getattr(loss, "lambda_list_g", getattr(loss, "lambda_list", 0.0)))
         if list_d_scheduler is not None:
             cur_list_d = cosine_decay_with_warmup(cur_nimg, **list_d_scheduler)
             loss.set_list_weights(lambda_list_d=cur_list_d)
         if list_g_scheduler is not None:
             cur_list_g = cosine_decay_with_warmup(cur_nimg, **list_g_scheduler)
             loss.set_list_weights(lambda_list_g=cur_list_g)
+        training_stats.report0("Progress/lambda_pair", float(getattr(loss, "lambda_pair", 0.0)))
+        training_stats.report0("Progress/pair_margin", float(getattr(loss, "pair_margin", 0.0)))
+        training_stats.report0("Progress/lambda_list", float(getattr(loss, "lambda_list", 0.0)))
+        training_stats.report0("Progress/lambda_list_d", cur_list_d)
+        training_stats.report0("Progress/lambda_list_g", cur_list_g)
+        training_stats.report0("Progress/lambda_local_rank", float(getattr(loss, "lambda_local_rank", 0.0)))
+        training_stats.report0("Progress/lambda_path_rank", float(getattr(loss, "lambda_path_rank", 0.0)))
+        training_stats.report0("Progress/list_tau", float(getattr(loss, "list_tau", 0.0)))
+        training_stats.report0("Progress/coupling_k", float(getattr(loss, "coupling_k", 0.0)))
+        training_stats.report0("Progress/local_rank_k", float(getattr(loss, "local_rank_k", 0.0)))
+        training_stats.report0("Progress/path_rank_k", float(getattr(loss, "path_rank_k", 0.0)))
 
         if augment_pipe is not None:
             augment_pipe.p.copy_(misc.constant(cur_aug_p, device=device))

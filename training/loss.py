@@ -156,6 +156,9 @@ def build_local_coupling(
     real_features: torch.Tensor,
     fake_features: torch.Tensor,
     k: int,
+    real_class_ids: torch.Tensor | None = None,
+    fake_class_ids: torch.Tensor | None = None,
+    return_info: bool = False,
 ) -> tuple:
     """Build sparse kNN coupling from fakes to nearest reals in feature space.
 
@@ -165,8 +168,75 @@ def build_local_coupling(
     fake_norm = F.normalize(fake_features.detach().to(torch.float32), dim=1)
     sim = torch.matmul(fake_norm, real_norm.t())
     k = min(k, real_norm.shape[0])
-    topk_sim, topk_idx = sim.topk(k, dim=1)
+    masked_sim = sim
+    available_neighbors = torch.full(
+        [fake_norm.shape[0]], fill_value=k, device=fake_norm.device, dtype=torch.int64
+    )
+    fallback_rows = torch.zeros(
+        [fake_norm.shape[0]], device=fake_norm.device, dtype=torch.bool
+    )
+    class_masked = False
+    same_class = None
+    if real_class_ids is not None and fake_class_ids is not None:
+        real_class_ids = real_class_ids.detach().to(fake_norm.device).reshape(-1)
+        fake_class_ids = fake_class_ids.detach().to(fake_norm.device).reshape(-1)
+        if real_class_ids.shape[0] != real_norm.shape[0]:
+            raise ValueError("real_class_ids must align with real_features")
+        if fake_class_ids.shape[0] != fake_norm.shape[0]:
+            raise ValueError("fake_class_ids must align with fake_features")
+        class_masked = True
+        same_class = fake_class_ids.unsqueeze(1).eq(real_class_ids.unsqueeze(0))
+        fallback_rows = ~same_class.any(dim=1)
+        available_neighbors = same_class.sum(dim=1).clamp(max=k)
+        masked_sim = sim.masked_fill(~same_class, float("-inf"))
+        if fallback_rows.any():
+            masked_sim = torch.where(fallback_rows.unsqueeze(1), sim, masked_sim)
+            available_neighbors = torch.where(
+                fallback_rows,
+                torch.full_like(available_neighbors, k),
+                available_neighbors,
+            )
+
+    topk_sim, topk_idx = masked_sim.topk(k, dim=1)
     coupling_weights = F.softmax(topk_sim, dim=1)
+    info = None
+    if return_info:
+        topk_sim_unmasked = sim.gather(1, topk_idx)
+        effective_neighbors = (coupling_weights > 0).sum(dim=1).to(torch.float32)
+        weight_entropy = -(
+            coupling_weights * coupling_weights.clamp_min(1e-12).log()
+        ).sum(dim=1)
+        info = dict(
+            class_masked=torch.full(
+                [fake_norm.shape[0]],
+                fill_value=1.0 if class_masked else 0.0,
+                device=fake_norm.device,
+                dtype=torch.float32,
+            ),
+            available_neighbors=available_neighbors.to(torch.float32),
+            effective_neighbors=effective_neighbors,
+            fallback_rows=fallback_rows.to(torch.float32),
+            top1_similarity=topk_sim_unmasked[:, 0],
+            weighted_similarity=(coupling_weights * topk_sim_unmasked).sum(dim=1),
+            top1_weight=coupling_weights[:, 0],
+            max_weight=coupling_weights.max(dim=1).values,
+            weight_entropy=weight_entropy,
+        )
+        if same_class is not None:
+            neighbor_same_class = same_class.gather(1, topk_idx).to(torch.float32)
+            info["same_class_mass"] = (coupling_weights * neighbor_same_class).sum(dim=1)
+            info["cross_class_mass"] = (
+                coupling_weights * (1.0 - neighbor_same_class)
+            ).sum(dim=1)
+            info["top1_same_class"] = neighbor_same_class[:, 0]
+        else:
+            ones = torch.ones([fake_norm.shape[0]], device=fake_norm.device, dtype=torch.float32)
+            zeros = torch.zeros_like(ones)
+            info["same_class_mass"] = ones
+            info["cross_class_mass"] = zeros
+            info["top1_same_class"] = ones
+    if return_info:
+        return topk_idx, coupling_weights, info
     return topk_idx, coupling_weights
 
 
@@ -534,6 +604,11 @@ class R3GANLoss:
         if lambda_list_g is not None:
             self.lambda_list_g = float(lambda_list_g)
 
+    def _phase_list_lambda(self, phase):
+        if self._requires_coupling():
+            return self.lambda_list_g if phase == "G" else self.lambda_list_d
+        return self.lambda_list
+
     def _as_scores(self, logits):
         return self.trainer._as_vector(logits)
 
@@ -643,11 +718,72 @@ class R3GANLoss:
         replay_stats = self._replay_coupled_gradients(buf, replay)
         self._report_coupled_stats(buf["phase"], metadata, replay, replay_stats)
 
+    def _report_weight_stats(self, phase, device):
+        list_lambda = self._phase_list_lambda(phase)
+        training_stats.report(
+            "Loss/weights/lambda_pair",
+            torch.as_tensor(self.lambda_pair, device=device),
+        )
+        training_stats.report(
+            "Loss/weights/pair_margin",
+            torch.as_tensor(self.pair_margin, device=device),
+        )
+        training_stats.report(
+            "Loss/weights/lambda_list",
+            torch.as_tensor(self.lambda_list, device=device),
+        )
+        training_stats.report(
+            "Loss/weights/lambda_list_d",
+            torch.as_tensor(self.lambda_list_d, device=device),
+        )
+        training_stats.report(
+            "Loss/weights/lambda_list_g",
+            torch.as_tensor(self.lambda_list_g, device=device),
+        )
+        training_stats.report(
+            "Loss/weights/active_lambda_list",
+            torch.as_tensor(list_lambda, device=device),
+        )
+        training_stats.report(
+            "Loss/weights/lambda_local_rank",
+            torch.as_tensor(self.lambda_local_rank, device=device),
+        )
+        training_stats.report(
+            "Loss/weights/lambda_path_rank",
+            torch.as_tensor(self.lambda_path_rank, device=device),
+        )
+        training_stats.report(
+            "Loss/config/coupling_enabled",
+            torch.as_tensor(1.0 if self._requires_coupling() else 0.0, device=device),
+        )
+        training_stats.report(
+            "Loss/config/coupling_k",
+            torch.as_tensor(float(self.coupling_k), device=device),
+        )
+        training_stats.report(
+            "Loss/config/local_rank_enabled",
+            torch.as_tensor(1.0 if self.lambda_local_rank > 0 else 0.0, device=device),
+        )
+        training_stats.report(
+            "Loss/config/local_rank_k",
+            torch.as_tensor(float(self.local_rank_k), device=device),
+        )
+        training_stats.report(
+            "Loss/config/path_rank_enabled",
+            torch.as_tensor(1.0 if self.path_rank_reg else 0.0, device=device),
+        )
+        training_stats.report(
+            "Loss/config/path_rank_k",
+            torch.as_tensor(float(self.path_rank_k), device=device),
+        )
+
     def _report_common_stats(
         self, phase, real_scores, fake_scores, pair_loss, list_loss, paired_delta, device
     ):
+        self._report_weight_stats(phase, device)
         zero_scalar = torch.zeros([], device=device)
         zero_vector = torch.zeros_like(paired_delta)
+        list_lambda = self._phase_list_lambda(phase)
         training_stats.report("Loss/scores/real", real_scores)
         training_stats.report("Loss/scores/fake", fake_scores)
         training_stats.report("Loss/signs/real", real_scores.sign())
@@ -656,18 +792,18 @@ class R3GANLoss:
         training_stats.report("Loss/signs/delta", paired_delta.sign())
         training_stats.report(
             "Loss/list_tau",
-            torch.as_tensor(self.list_tau if self.lambda_list > 0 else 0.0, device=device),
+            torch.as_tensor(self.list_tau if list_lambda > 0 else 0.0, device=device),
         )
         training_stats.report(
             "Loss/list_type_code",
-            torch.as_tensor(1.0 if self.lambda_list > 0 else 0.0, device=device),
+            torch.as_tensor(1.0 if list_lambda > 0 else 0.0, device=device),
         )
         if phase == "G":
             training_stats.report("Loss/G/pair", pair_loss)
             training_stats.report("Loss/G/list", list_loss)
             training_stats.report(
                 "Loss/G/infonce",
-                list_loss if self.lambda_list > 0 else zero_vector,
+                list_loss if list_lambda > 0 else zero_vector,
             )
             training_stats.report("Loss/G/local_rank", zero_scalar)
             training_stats.report("Loss/G/path_rank", zero_scalar)
@@ -676,8 +812,36 @@ class R3GANLoss:
             training_stats.report("Loss/D/list", list_loss)
             training_stats.report(
                 "Loss/D/infonce",
-                list_loss if self.lambda_list > 0 else zero_vector,
+                list_loss if list_lambda > 0 else zero_vector,
             )
+
+    def _report_coupling_stats(self, coupling_info):
+        if coupling_info is None:
+            return
+        training_stats.report("Loss/coupling/class_masked", coupling_info["class_masked"])
+        training_stats.report(
+            "Loss/coupling/available_neighbors", coupling_info["available_neighbors"]
+        )
+        training_stats.report(
+            "Loss/coupling/effective_neighbors", coupling_info["effective_neighbors"]
+        )
+        training_stats.report("Loss/coupling/fallback_rows", coupling_info["fallback_rows"])
+        training_stats.report("Loss/coupling/top1_similarity", coupling_info["top1_similarity"])
+        training_stats.report(
+            "Loss/coupling/weighted_similarity", coupling_info["weighted_similarity"]
+        )
+        training_stats.report("Loss/coupling/top1_weight", coupling_info["top1_weight"])
+        training_stats.report("Loss/coupling/max_weight", coupling_info["max_weight"])
+        training_stats.report("Loss/coupling/weight_entropy", coupling_info["weight_entropy"])
+        training_stats.report(
+            "Loss/coupling/same_class_mass", coupling_info["same_class_mass"]
+        )
+        training_stats.report(
+            "Loss/coupling/cross_class_mass", coupling_info["cross_class_mass"]
+        )
+        training_stats.report(
+            "Loss/coupling/top1_same_class", coupling_info["top1_same_class"]
+        )
 
     def _class_ids(self, c):
         if c is None or c.ndim == 0 or (c.ndim == 2 and c.shape[1] == 0):
@@ -805,6 +969,7 @@ class R3GANLoss:
             total_gain=float(total_gain),
             replay_scale=float(total_gain) * float(self._world_size()),
             pair_loss=zero_vector,
+            pair_loss_value=zero_scalar,
             list_loss=zero_vector,
             list_loss_value=zero_scalar,
             grad_real_aug=None,
@@ -812,6 +977,7 @@ class R3GANLoss:
             local_rank_loss=zero_scalar,
             local_rank_adjacent_losses=torch.zeros([0], device=device, dtype=torch.float32),
             grad_fake_clean=None,
+            coupling_info=None,
         )
 
         coupling = None
@@ -820,12 +986,34 @@ class R3GANLoss:
                 global_meta["clean_real_features"],
                 global_meta["clean_fake_features"],
                 k=self.coupling_k,
+                real_class_ids=global_meta["class_ids"],
+                fake_class_ids=global_meta["class_ids"],
+                return_info=True,
             )
 
         paired_delta = pairwise_delta(local["aug_real_scores"], local["aug_fake_scores"])
         if phase == "G":
             if self._requires_coupling():
-                neighbor_indices, coupling_weights = coupling
+                neighbor_indices, coupling_weights, coupling_info = coupling
+                global_delta = local_delta(
+                    global_meta["aug_real_scores"],
+                    global_meta["aug_fake_scores"],
+                    neighbor_indices,
+                )
+                global_pair_loss = (
+                    local_pairwise_generator_loss(
+                        global_delta, coupling_weights, margin=self.pair_margin
+                    )
+                    if self.lambda_pair > 0
+                    else torch.zeros_like(global_meta["aug_fake_scores"])
+                )
+                global_list_loss = (
+                    local_listwise_generator_loss(
+                        global_delta, coupling_weights, tau=self.list_tau
+                    )
+                    if self.lambda_list_g > 0
+                    else torch.zeros_like(global_meta["aug_fake_scores"])
+                )
                 _, loss_vector, grad_fake = local_coupled_generator_loss_with_grads(
                     global_meta["aug_real_scores"],
                     global_meta["aug_fake_scores"],
@@ -833,14 +1021,22 @@ class R3GANLoss:
                     lambda_pair=self.lambda_pair, pair_margin=self.pair_margin,
                     lambda_list=self.lambda_list_g, list_tau=self.list_tau,
                 )
-                replay["pair_loss"] = loss_vector[local_slice]
+                del loss_vector
+                replay["pair_loss"] = global_pair_loss[local_slice]
+                replay["pair_loss_value"] = global_pair_loss.mean()
+                replay["list_loss"] = global_list_loss[local_slice]
+                replay["list_loss_value"] = global_list_loss.mean()
                 replay["grad_fake_aug"] = grad_fake[local_slice]
+                replay["coupling_info"] = {
+                    name: value[local_slice] for name, value in coupling_info.items()
+                }
                 return replay
             replay["pair_loss"] = (
                 pairwise_generator_loss(paired_delta, margin=self.pair_margin)
                 if self.lambda_pair > 0
                 else zero_vector
             )
+            replay["pair_loss_value"] = replay["pair_loss"].mean()
             if self.lambda_list > 0:
                 list_loss_value, global_list_loss, grad_fake = infonce_generator_loss_with_grads(
                     global_meta["aug_real_scores"],
@@ -853,7 +1049,26 @@ class R3GANLoss:
             return replay
 
         if self._requires_coupling():
-            neighbor_indices, coupling_weights = coupling
+            neighbor_indices, coupling_weights, coupling_info = coupling
+            global_delta = local_delta(
+                global_meta["aug_real_scores"],
+                global_meta["aug_fake_scores"],
+                neighbor_indices,
+            )
+            global_pair_loss = (
+                local_pairwise_discriminator_loss(
+                    global_delta, coupling_weights, margin=self.pair_margin
+                )
+                if self.lambda_pair > 0
+                else torch.zeros_like(global_meta["aug_fake_scores"])
+            )
+            global_list_loss = (
+                local_listwise_discriminator_loss(
+                    global_delta, coupling_weights, tau=self.list_tau
+                )
+                if self.lambda_list_d > 0
+                else torch.zeros_like(global_meta["aug_fake_scores"])
+            )
             _, loss_vector, grad_real, grad_fake = local_coupled_discriminator_loss_with_grads(
                 global_meta["aug_real_scores"],
                 global_meta["aug_fake_scores"],
@@ -861,9 +1076,16 @@ class R3GANLoss:
                 lambda_pair=self.lambda_pair, pair_margin=self.pair_margin,
                 lambda_list=self.lambda_list_d, list_tau=self.list_tau,
             )
-            replay["pair_loss"] = loss_vector[local_slice]
+            del loss_vector
+            replay["pair_loss"] = global_pair_loss[local_slice]
+            replay["pair_loss_value"] = global_pair_loss.mean()
+            replay["list_loss"] = global_list_loss[local_slice]
+            replay["list_loss_value"] = global_list_loss.mean()
             replay["grad_real_aug"] = grad_real[local_slice]
             replay["grad_fake_aug"] = grad_fake[local_slice]
+            replay["coupling_info"] = {
+                name: value[local_slice] for name, value in coupling_info.items()
+            }
             # local_rank computed separately if enabled (existing code still runs below)
         else:
             replay["pair_loss"] = (
@@ -871,6 +1093,7 @@ class R3GANLoss:
                 if self.lambda_pair > 0
                 else zero_vector
             )
+            replay["pair_loss_value"] = replay["pair_loss"].mean()
             if self.lambda_list > 0:
                 (
                     list_loss_value,
@@ -906,6 +1129,7 @@ class R3GANLoss:
     def _report_coupled_stats(self, phase, metadata, replay, replay_stats):
         local = metadata["local"]
         paired_delta = pairwise_delta(local["aug_real_scores"], local["aug_fake_scores"])
+        self._report_coupling_stats(replay["coupling_info"])
         self._report_common_stats(
             phase,
             real_scores=local["aug_real_scores"],
@@ -917,7 +1141,8 @@ class R3GANLoss:
         )
 
         pair_term = self.lambda_pair * replay["pair_loss"].mean()
-        list_term = self.lambda_list * replay["list_loss"].mean()
+        list_lambda = self._phase_list_lambda(phase)
+        list_term = list_lambda * replay["list_loss"].mean()
         if phase == "G":
             total_loss = pair_term + list_term
             training_stats.report("Loss/G/pair_weighted", pair_term)

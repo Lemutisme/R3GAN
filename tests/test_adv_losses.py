@@ -814,6 +814,49 @@ class TestStatsSemantics(unittest.TestCase):
         self.assertTrue(torch.allclose(reports["Loss/scores/fake"], expected_fake_scores))
         self.assertTrue(torch.allclose(reports["Loss/delta/pair"], expected_delta))
 
+    def test_coupled_stats_report_pair_list_weights_and_coupling(self):
+        loss_obj = R3GANLoss(
+            G=TinyG(),
+            D=TinyFeatureD(),
+            lambda_pair=1.0,
+            lambda_list=0.0,
+            coupling_k=2,
+            lambda_list_d=0.5,
+            lambda_list_g=0.1,
+            use_r1_penalty=False,
+            use_r2_penalty=False,
+        )
+        loss_obj.G.requires_grad_(False)
+        loss_obj.D.requires_grad_(True)
+        real = torch.randn(4, 3, 4, 4)
+        cond = F.one_hot(torch.tensor([0, 1, 0, 1]), num_classes=2).to(torch.float32)
+        noise = torch.randn(4, 4)
+
+        reports = {}
+
+        def _capture(name, value):
+            if torch.is_tensor(value):
+                reports[name] = value.detach().clone()
+            else:
+                reports[name] = torch.as_tensor(value)
+
+        with mock.patch("training.loss.training_stats.report", side_effect=_capture):
+            loss_obj.accumulate_gradients("D", real, cond, noise, gamma=0.1, gain=1.0)
+            loss_obj.finalize_accumulation()
+
+        self.assertIn("Loss/D/pair", reports)
+        self.assertIn("Loss/D/list", reports)
+        self.assertGreater(reports["Loss/D/pair"].abs().sum().item(), 0.0)
+        self.assertGreater(reports["Loss/D/list"].abs().sum().item(), 0.0)
+        self.assertAlmostEqual(reports["Loss/weights/lambda_list_d"].item(), 0.5, places=6)
+        self.assertAlmostEqual(reports["Loss/weights/lambda_list_g"].item(), 0.1, places=6)
+        self.assertAlmostEqual(reports["Loss/config/coupling_k"].item(), 2.0, places=6)
+        self.assertTrue(torch.allclose(reports["Loss/coupling/class_masked"], torch.ones(4)))
+        self.assertTrue(torch.allclose(reports["Loss/coupling/fallback_rows"], torch.zeros(4)))
+        self.assertTrue(torch.allclose(reports["Loss/coupling/same_class_mass"], torch.ones(4)))
+        self.assertTrue(torch.allclose(reports["Loss/coupling/cross_class_mass"], torch.zeros(4)))
+        self.assertTrue((reports["Loss/coupling/effective_neighbors"] >= 1).all())
+
 
 @unittest.skipIf(
     torch is None or CliRunner is None or dnnlib is None,
@@ -932,6 +975,52 @@ class TestLocalCoupling(unittest.TestCase):
         indices, weights = build_local_coupling(real_feat, fake_feat, k=2)
         self.assertEqual(indices[0, 0].item(), 0)  # nearest = real[0]
         self.assertGreater(weights[0, 0].item(), weights[0, 1].item())
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_build_local_coupling_respects_class_ids(self):
+        from training.loss import build_local_coupling
+        real_feat = torch.tensor([
+            [1.0, 0.0],
+            [0.98, 0.02],
+            [0.9, 0.1],
+            [0.0, 1.0],
+        ])
+        fake_feat = torch.tensor([[1.0, 0.0]])
+        real_class_ids = torch.tensor([1, 0, 0, 1])
+        fake_class_ids = torch.tensor([0])
+        indices, weights, info = build_local_coupling(
+            real_feat,
+            fake_feat,
+            k=2,
+            real_class_ids=real_class_ids,
+            fake_class_ids=fake_class_ids,
+            return_info=True,
+        )
+        self.assertTrue(torch.equal(indices[0], torch.tensor([1, 2])))
+        self.assertTrue(torch.allclose(weights.sum(dim=1), torch.ones(1), atol=1e-5))
+        self.assertAlmostEqual(info["same_class_mass"][0].item(), 1.0, places=6)
+        self.assertAlmostEqual(info["cross_class_mass"][0].item(), 0.0, places=6)
+        self.assertAlmostEqual(info["fallback_rows"][0].item(), 0.0, places=6)
+
+    @unittest.skipIf(torch is None, 'PyTorch not available')
+    def test_build_local_coupling_falls_back_when_class_missing(self):
+        from training.loss import build_local_coupling
+        real_feat = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+        fake_feat = torch.tensor([[0.9, 0.1]])
+        real_class_ids = torch.tensor([0, 0, 1])
+        fake_class_ids = torch.tensor([2])
+        indices, weights, info = build_local_coupling(
+            real_feat,
+            fake_feat,
+            k=2,
+            real_class_ids=real_class_ids,
+            fake_class_ids=fake_class_ids,
+            return_info=True,
+        )
+        self.assertEqual(indices.shape, (1, 2))
+        self.assertTrue(torch.isfinite(weights).all())
+        self.assertTrue(torch.allclose(weights.sum(dim=1), torch.ones(1), atol=1e-5))
+        self.assertAlmostEqual(info["fallback_rows"][0].item(), 1.0, places=6)
 
     @unittest.skipIf(torch is None, 'PyTorch not available')
     def test_local_delta_values(self):

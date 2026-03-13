@@ -72,6 +72,8 @@ The delta-centric RankGAN variants are organized as:
 - **RankGAN-v3**: v1/v2 plus semantic-local gap-rank prior on D (`--lambda-local-rank`).
 - **Deprecated path prior**: interpolation-based auxiliary regularizer (`--path-rank-reg`).
 
+RankGAN-v2/v3 compute coupled listwise competition over the full phase batch (across all ranks when distributed) and use clean, non-augmented discriminator features for the semantic-local prior.
+
 The easiest way to explore different training settings is to modify [`train.py`](./train.py) directly.
 
 ## Pre-trained models

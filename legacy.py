@@ -35,10 +35,12 @@ def load_network_pkl(f, force_fp16=False):
         data['training_set_kwargs'] = None
     if 'augment_pipe' not in data:
         data['augment_pipe'] = None
+    if 'D' not in data:
+        data['D'] = None
 
     # Validate contents.
     assert isinstance(data['G'], torch.nn.Module)
-    assert isinstance(data['D'], torch.nn.Module)
+    assert isinstance(data['D'], (torch.nn.Module, type(None)))
     assert isinstance(data['G_ema'], torch.nn.Module)
     assert isinstance(data['training_set_kwargs'], (dict, type(None)))
     assert isinstance(data['augment_pipe'], (torch.nn.Module, type(None)))
@@ -47,6 +49,8 @@ def load_network_pkl(f, force_fp16=False):
     if force_fp16:
         for key in ['G', 'D', 'G_ema']:
             old = data[key]
+            if old is None:
+                continue
             kwargs = copy.deepcopy(old.init_kwargs)
             fp16_kwargs = kwargs.get('synthesis_kwargs', kwargs)
             fp16_kwargs.num_fp16_res = 4
