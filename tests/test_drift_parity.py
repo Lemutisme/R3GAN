@@ -25,6 +25,20 @@ from drifting_models.drift_field import (
     compute_v as ref_compute_v,
 )
 
+from training.drift_loss import (
+    DriftingLossConfig as NewDriftingLossConfig,
+    drifting_stopgrad_loss as new_stopgrad_loss,
+    drifting_stopgrad_loss_multi_temperature as new_multi_temp_loss,
+    compute_weighted_drift as new_compute_weighted_drift,
+)
+from drifting_models.drift_loss import (
+    DriftingLossConfig as RefDriftingLossConfig,
+    drifting_stopgrad_loss as ref_stopgrad_loss,
+    drifting_stopgrad_loss_multi_temperature as ref_multi_temp_loss,
+    compute_weighted_drift as ref_compute_weighted_drift,
+)
+from drifting_models.drift_field import DriftFieldConfig as RefDriftFieldConfig2
+
 
 def toy_compute_drift(gen: torch.Tensor, pos: torch.Tensor, temp: float = 0.05) -> torch.Tensor:
     """
@@ -165,6 +179,82 @@ class TestDriftFieldParity(unittest.TestCase):
         # All three should agree.
         torch.testing.assert_close(new_v, ref_v)
         torch.testing.assert_close(new_v, toy_v, atol=1e-5, rtol=1e-5)
+
+
+class TestDriftLossParity(unittest.TestCase):
+    """Verify training.drift_loss matches drifting_models.drift_loss exactly."""
+
+    # ------------------------------------------------------------------
+    # drifting_stopgrad_loss
+    # ------------------------------------------------------------------
+    def test_drifting_stopgrad_loss_parity(self) -> None:
+        torch.manual_seed(42)
+        x = torch.randn(5, 16)
+        y_pos = torch.randn(4, 16)
+        y_neg = torch.randn(5, 16)
+        temp = 0.1
+
+        new_cfg = NewDriftingLossConfig(drift_field=NewDriftFieldConfig(temperature=temp))
+        ref_cfg = RefDriftingLossConfig(drift_field=RefDriftFieldConfig(temperature=temp))
+
+        new_loss, new_drift, new_stats = new_stopgrad_loss(
+            x, y_pos, y_neg, config=new_cfg,
+        )
+        ref_loss, ref_drift, ref_stats = ref_stopgrad_loss(
+            x, y_pos, y_neg, config=ref_cfg,
+        )
+
+        torch.testing.assert_close(new_loss, ref_loss)
+        torch.testing.assert_close(new_drift, ref_drift)
+        for key in ref_stats:
+            self.assertAlmostEqual(new_stats[key], ref_stats[key], places=6, msg=f"stat '{key}' mismatch")
+
+    # ------------------------------------------------------------------
+    # drifting_stopgrad_loss_multi_temperature
+    # ------------------------------------------------------------------
+    def test_multi_temperature_loss_parity(self) -> None:
+        torch.manual_seed(42)
+        x = torch.randn(5, 16)
+        y_pos = torch.randn(4, 16)
+        y_neg = torch.randn(5, 16)
+        temps = (0.01, 0.05, 0.1)
+
+        new_cfg = NewDriftingLossConfig(drift_field=NewDriftFieldConfig(temperature=0.05))
+        ref_cfg = RefDriftingLossConfig(drift_field=RefDriftFieldConfig(temperature=0.05))
+
+        new_loss, new_stats = new_multi_temp_loss(
+            x, y_pos, y_neg, temperatures=temps, config=new_cfg,
+        )
+        ref_loss, ref_stats = ref_multi_temp_loss(
+            x, y_pos, y_neg, temperatures=temps, config=ref_cfg,
+        )
+
+        torch.testing.assert_close(new_loss, ref_loss)
+        for key in ref_stats:
+            self.assertAlmostEqual(new_stats[key], ref_stats[key], places=6, msg=f"stat '{key}' mismatch")
+
+    # ------------------------------------------------------------------
+    # compute_weighted_drift
+    # ------------------------------------------------------------------
+    def test_compute_weighted_drift_parity(self) -> None:
+        torch.manual_seed(42)
+        x = torch.randn(5, 16)
+        y_pos = torch.randn(4, 16)
+        y_neg = torch.randn(5, 16)
+
+        new_cfg = NewDriftingLossConfig(drift_field=NewDriftFieldConfig(temperature=0.1))
+        ref_cfg = RefDriftingLossConfig(drift_field=RefDriftFieldConfig(temperature=0.1))
+
+        new_drift, new_stats = new_compute_weighted_drift(
+            x, y_pos, y_neg, config=new_cfg,
+        )
+        ref_drift, ref_stats = ref_compute_weighted_drift(
+            x, y_pos, y_neg, config=ref_cfg,
+        )
+
+        torch.testing.assert_close(new_drift, ref_drift)
+        for key in ref_stats:
+            self.assertAlmostEqual(new_stats[key], ref_stats[key], places=6, msg=f"stat '{key}' mismatch")
 
 
 if __name__ == "__main__":
