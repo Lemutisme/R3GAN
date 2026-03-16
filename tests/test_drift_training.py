@@ -453,6 +453,25 @@ class TestDriftLegacyCompatibility(unittest.TestCase):
         self.assertIsNone(loaded["D"])
         self.assertIsInstance(loaded["G_ema"], torch.nn.Module)
 
+    def test_legacy_loader_populates_rgm_metadata_defaults(self):
+        payload = {
+            "G": torch.nn.Linear(2, 2),
+            "D": None,
+            "G_ema": torch.nn.Linear(2, 2),
+            "training_set_kwargs": None,
+            "augment_pipe": None,
+        }
+        buffer = io.BytesIO()
+        pickle.dump(payload, buffer)
+        buffer.seek(0)
+
+        loaded = legacy.load_network_pkl(buffer)
+        self.assertEqual(loaded["trainer"], "gan")
+        self.assertIsNone(loaded["rgm_mode"])
+        self.assertIsNone(loaded["condition_schema"])
+        self.assertIsNone(loaded["rank_levels"])
+        self.assertIsNone(loaded["transport_state"])
+
 
 @unittest.skipIf(torch is None or drift_research_impl is None, "Drift research trainer is not available")
 class TestDriftEMA(unittest.TestCase):

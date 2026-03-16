@@ -76,6 +76,29 @@ RankGAN-v2/v3 compute coupled listwise competition over the full phase batch (ac
 
 The easiest way to explore different training settings is to modify [`train.py`](./train.py) directly.
 
+## Experimental RGM
+
+RGM v0 adds a third training lane that keeps the existing GAN and drift baselines intact while introducing a conv-only, conditional-only rank-drift trainer.
+
+```
+# CIFAR10 RGM v0 (conv-only drift-rank lane)
+python train.py --outdir=./training-runs --data=./datasets/cifar10.zip --gpus=1 --batch=24 --mirror=1 --cond=1 --preset=CIFAR10 \
+    --trainer=rgm --rgm-mode=drift_rank --negatives-per-group=2 --positives-per-group=4 \
+    --rank-levels=1.0,0.5,0.0 --learning-rate=2e-4 --lambda-transport=1.0 --lambda-order=0.5 --lambda-eq=0.25
+
+# Sample a same-seed rank path from an RGM snapshot
+python gen_images.py --network=network-snapshot.pkl --seeds=0-3 --class=0 --rank-grid=1.0,0.5,0.0 --outdir=out
+
+# Toy 2D rank-drift sanity check
+python scripts/train_toy_rgm.py --dataset=checkerboard --toy-mode=rank_drift --rank-levels=1.0,0.5,0.0 --outdir=./toy-runs/checkerboard
+```
+
+Current scope notes:
+
+- `trainer=rgm` only supports the conv generator backend in this patch.
+- `trainer=rgm` requires `--cond=1` and a labeled dataset.
+- Only `--rgm-mode=drift_rank` is live in v0; flow and hybrid remain future work.
+
 ## Pre-trained models
 
 We provide pre-trained models for our proposed training configuration (config E) on each dataset:

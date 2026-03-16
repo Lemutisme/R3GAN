@@ -16,10 +16,19 @@ import torch
 from torch.utils.cpp_extension import verify_ninja_availability
 
 import dnnlib
-from training import training_loop
-from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
+
+metric_main = None
+
+
+def _load_metric_main():
+    global metric_main
+    if metric_main is None:
+        from metrics import metric_main as metric_main_impl
+
+        metric_main = metric_main_impl
+    return metric_main
 
 # ----------------------------------------------------------------------------
 
@@ -56,11 +65,18 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = "none"
 
     # Execute training loop.
-    if getattr(c, "trainer", "gan") == "drift":
+    trainer = getattr(c, "trainer", "gan")
+    if trainer == "drift":
         from training import drift_training_loop
 
         drift_training_loop.training_loop(rank=rank, **c)
+    elif trainer == "rgm":
+        from training import rgm_training_loop
+
+        rgm_training_loop.training_loop(rank=rank, **c)
     else:
+        from training import training_loop
+
         training_loop.training_loop(rank=rank, **c)
 
 
@@ -306,8 +322,15 @@ def _infer_drift_periodic_eval_paths(*, dataset_name, data_path, inception_weigh
 @click.option(
     "--trainer",
     help="Training mode",
-    type=click.Choice(["gan", "drift"]),
+    type=click.Choice(["gan", "drift", "rgm"]),
     default="gan",
+    show_default=True,
+)
+@click.option(
+    "--rgm-mode",
+    help="RGM mode",
+    type=click.Choice(["drift_rank"]),
+    default="drift_rank",
     show_default=True,
 )
 # Optional features.
@@ -635,6 +658,48 @@ def _infer_drift_periodic_eval_paths(*, dataset_name, data_path, inception_weigh
     show_default=True,
 )
 @click.option(
+    "--rank-levels",
+    help="Comma-separated rank levels ordered worst-to-best",
+    type=str,
+    default="1.0,0.5,0.0",
+    show_default=True,
+)
+@click.option(
+    "--rank-min",
+    help="Minimum rank value for normalization",
+    type=float,
+    default=0.0,
+    show_default=True,
+)
+@click.option(
+    "--rank-max",
+    help="Maximum rank value for normalization",
+    type=float,
+    default=1.0,
+    show_default=True,
+)
+@click.option(
+    "--lambda-transport",
+    help="Weight for adjacent rank transport loss",
+    type=float,
+    default=1.0,
+    show_default=True,
+)
+@click.option(
+    "--lambda-order",
+    help="Weight for rank-order drift-norm loss",
+    type=float,
+    default=0.5,
+    show_default=True,
+)
+@click.option(
+    "--lambda-eq",
+    help="Weight for best-rank fixed-point loss",
+    type=float,
+    default=0.25,
+    show_default=True,
+)
+@click.option(
     "--drift-temperature",
     help="Temperature for pixel-space drift affinity",
     type=float,
@@ -953,6 +1018,7 @@ def _infer_drift_periodic_eval_paths(*, dataset_name, data_path, inception_weigh
 )
 @click.option("-n", "--dry-run", help="Print training options and exit", is_flag=True)
 def main(**kwargs):
+    metric_main_impl = _load_metric_main()
     # Initialize config.
     opts = dnnlib.EasyDict(kwargs)  # Command line arguments.
     c = dnnlib.EasyDict()  # Main config dict.
@@ -1223,11 +1289,11 @@ def main(**kwargs):
         raise click.ClickException(
             "--batch must be a multiple of --gpus times --batch-gpu"
         )
-    if any(not metric_main.is_valid_metric(metric) for metric in c.metrics):
+    if any(not metric_main_impl.is_valid_metric(metric) for metric in c.metrics):
         raise click.ClickException(
             "\n".join(
                 ["--metrics can only contain the following values:"]
-                + metric_main.list_valid_metrics()
+                + metric_main_impl.list_valid_metrics()
             )
         )
     if opts.lambda_rank < 0:
@@ -1281,6 +1347,125 @@ def main(**kwargs):
     # Performance-related toggles.
     if opts.nobench:
         c.cudnn_benchmark = False
+
+    if opts.trainer == "rgm":
+        if not opts.cond:
+            raise click.ClickException("--trainer=rgm requires --cond=1")
+        if not c.training_set_kwargs.use_labels:
+            raise click.ClickException("--trainer=rgm requires a labeled dataset")
+        if opts.rank_max < opts.rank_min:
+            raise click.ClickException("--rank-max must be >= --rank-min")
+        if opts.drift_temperature <= 0:
+            raise click.ClickException("--drift-temperature must be positive")
+        if opts.learning_rate <= 0:
+            raise click.ClickException("--learning-rate must be positive")
+        if opts.adam_beta1 < 0 or opts.adam_beta1 >= 1:
+            raise click.ClickException("--adam-beta1 must be in [0, 1)")
+        if opts.adam_beta2 < 0 or opts.adam_beta2 >= 1:
+            raise click.ClickException("--adam-beta2 must be in [0, 1)")
+        if opts.weight_decay < 0:
+            raise click.ClickException("--weight-decay must be non-negative")
+        if opts.lambda_transport < 0:
+            raise click.ClickException("--lambda-transport must be non-negative")
+        if opts.lambda_order < 0:
+            raise click.ClickException("--lambda-order must be non-negative")
+        if opts.lambda_eq < 0:
+            raise click.ClickException("--lambda-eq must be non-negative")
+
+        rank_levels = parse_float_list(opts.rank_levels)
+        if len(rank_levels) < 2:
+            raise click.ClickException("--rank-levels must contain at least two values")
+        if any(level < opts.rank_min or level > opts.rank_max for level in rank_levels):
+            raise click.ClickException("--rank-levels must lie within [--rank-min, --rank-max]")
+        if any(rank_levels[idx + 1] >= rank_levels[idx] for idx in range(len(rank_levels) - 1)):
+            raise click.ClickException("--rank-levels must be strictly descending (worst to best)")
+        if c.batch_size % (c.num_gpus * opts.negatives_per_group * len(rank_levels)) != 0:
+            raise click.ClickException(
+                "--batch / --gpus must be divisible by --negatives-per-group * len(rank_levels) for rgm training"
+            )
+        if opts.queue_push_batch % c.num_gpus != 0:
+            raise click.ClickException("--queue-push-batch must be divisible by --gpus")
+
+        if opts.aug:
+            click.echo("NOTE: --aug is ignored for --trainer=rgm.")
+        if opts.disable_r1 or opts.disable_r2 or opts.non_aug_gp:
+            click.echo("NOTE: R1/R2 and non-aug GP flags are ignored for --trainer=rgm.")
+        if (
+            opts.lambda_pair is not None
+            or opts.pair_margin is not None
+            or opts.lambda_list is not None
+            or opts.list_tau is not None
+            or opts.lambda_local_rank != 0.0
+            or opts.coupling_k != 0
+            or opts.path_rank_reg
+            or opts.rank_loss
+        ):
+            click.echo("NOTE: adversarial and discriminator-side ranking options are ignored for --trainer=rgm.")
+
+        optimizer_class_name = "torch.optim.AdamW" if float(opts.weight_decay) > 0 else "torch.optim.Adam"
+        c.G_kwargs.class_name = "training.networks.RankConditionedGenerator"
+        c.G_kwargs.UseAlpha = False
+        c.G_kwargs.UseRank = True
+        c.G_kwargs.UseRankPair = False
+        c.G_kwargs.RankMin = float(opts.rank_min)
+        c.G_kwargs.RankMax = float(opts.rank_max)
+        c.G_kwargs.EvalRank = float(rank_levels[-1])
+        c.G_opt_kwargs = dnnlib.EasyDict(
+            class_name=optimizer_class_name,
+            lr=float(opts.learning_rate),
+            betas=[float(opts.adam_beta1), float(opts.adam_beta2)],
+            eps=1e-8,
+        )
+        if optimizer_class_name.endswith("AdamW"):
+            c.G_opt_kwargs.weight_decay = float(opts.weight_decay)
+
+        c.D_kwargs = None
+        c.D_opt_kwargs = None
+        c.loss_kwargs = dnnlib.EasyDict(
+            temperature=float(opts.drift_temperature),
+            order_margin=0.0,
+            lambda_transport=float(opts.lambda_transport),
+            lambda_order=float(opts.lambda_order),
+            lambda_eq=float(opts.lambda_eq),
+        )
+        c.augment_kwargs = None
+        c.aug_scheduler = None
+        c.gamma_scheduler = None
+        c.lr_scheduler = None
+        c.beta2_scheduler = None
+        if opts.scheduler == "cosine":
+            c.lr_scheduler = dict(
+                base_value=float(opts.learning_rate),
+                final_value=0.0,
+                total_nimg=int(c.total_kimg * 1000),
+            )
+        elif opts.scheduler == "warmup_cosine":
+            c.lr_scheduler = dict(
+                base_value=float(opts.learning_rate),
+                final_value=0.0,
+                total_nimg=int(c.total_kimg * 1000),
+                warmup_value=0.0,
+                warmup_nimg=int(opts.warmup_steps * c.batch_size),
+            )
+        c.negatives_per_group = opts.negatives_per_group
+        c.positives_per_group = opts.positives_per_group
+        c.unconditional_per_group = opts.unconditional_per_group
+        c.queue_capacity_per_class = opts.queue_capacity_per_class
+        c.queue_capacity_global = opts.queue_capacity_global
+        c.queue_push_batch = opts.queue_push_batch
+        c.queue_warmup_batches = opts.queue_warmup_batches
+        c.rank_levels = rank_levels
+        c.rgm_mode = opts.rgm_mode
+
+        desc = f"{dataset_name:s}-rgm-gpus{c.num_gpus:d}-batch{c.batch_size:d}"
+        desc += f"-{opts.rgm_mode}"
+        desc += f"-neg{opts.negatives_per_group:d}-pos{opts.positives_per_group:d}"
+        desc += "-ranks" + "_".join(f"{value:g}" for value in rank_levels)
+        if opts.desc is not None:
+            desc += f"-{opts.desc}"
+
+        launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
+        return
 
     if opts.trainer == "drift":
         if not opts.cond:

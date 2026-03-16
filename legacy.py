@@ -37,6 +37,16 @@ def load_network_pkl(f, force_fp16=False):
         data['augment_pipe'] = None
     if 'D' not in data:
         data['D'] = None
+    if 'trainer' not in data:
+        data['trainer'] = 'gan'
+    if 'rgm_mode' not in data:
+        data['rgm_mode'] = None
+    if 'condition_schema' not in data:
+        data['condition_schema'] = None
+    if 'rank_levels' not in data:
+        data['rank_levels'] = None
+    if 'transport_state' not in data:
+        data['transport_state'] = None
 
     # Validate contents.
     assert isinstance(data['G'], torch.nn.Module)
