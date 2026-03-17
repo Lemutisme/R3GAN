@@ -3,7 +3,7 @@ import torch.nn as nn
 import copy
 import R3GAN.Networks
 
-from training.drift_reference import DiTLikeConfig, DiTLikeGenerator as ReferenceDiTLikeGenerator
+from training.models.dit_like import DiTLikeConfig, DiTLikeGenerator as ReferenceDiTLikeGenerator
 
 class Generator(nn.Module):
     def __init__(self, *args, **kw):
