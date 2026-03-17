@@ -10,6 +10,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -114,6 +115,7 @@ class ClassConditionalSampleQueue:
             GlobalImages = torch.stack(list(self._global_queue), dim=0).to('cpu')
             GlobalLabels = torch.tensor(list(self._global_labels), dtype=torch.long)
         return {
+            'version': 1,
             'config': {
                 'num_classes': int(self.config.num_classes),
                 'per_class_capacity': int(self.config.per_class_capacity),
@@ -139,6 +141,8 @@ class ClassConditionalSampleQueue:
         }
         for Key, ExpectedValue in Expected.items():
             ActualValue = ConfigState.get(Key)
+            if Key == 'strict_without_replacement' and ActualValue is None:
+                ActualValue = False
             if ActualValue != ExpectedValue:
                 raise ValueError(f'queue config mismatch for {Key}: expected {ExpectedValue}, found {ActualValue}')
 
@@ -157,6 +161,32 @@ class ClassConditionalSampleQueue:
 
 
 #----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GroupedSamplingConfig:
+    positives_per_group: int
+    unconditional_per_group: int
+
+
+def sample_grouped_real_batches(
+    *,
+    queue: ClassConditionalSampleQueue,
+    class_labels: torch.Tensor,
+    config: GroupedSamplingConfig,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    positives = queue.sample_positive_grouped(
+        class_labels,
+        config.positives_per_group,
+        device,
+    )
+    unconditional = queue.sample_unconditional_grouped(
+        class_labels.shape[0],
+        config.unconditional_per_group,
+        device,
+    )
+    return positives, unconditional
 
 
 def ensure_class_coverage(queue, class_ids, refill_fn, required_count=1, max_attempts=128):
