@@ -17,7 +17,7 @@ python train.py \
     --trainer=drift \
     --drift-backbone=dit_like \
     --batch=32 \
-    --total-kimg=0.05 \
+    --kimg=0.05 \
     --kimg-per-tick=0.01 \
     --image-snapshot-ticks=999 \
     --network-snapshot-ticks=999 \

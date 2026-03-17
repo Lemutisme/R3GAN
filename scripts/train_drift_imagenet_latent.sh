@@ -89,7 +89,7 @@ python train.py \
     --batch="$BATCH" \
     --trainer=drift \
     --drift-backbone=dit_like \
-    --total-kimg="$TOTAL_KIMG" \
+    --kimg="$TOTAL_KIMG" \
     \
     --hidden-dim=$HIDDEN_DIM \
     --depth=$DEPTH \
