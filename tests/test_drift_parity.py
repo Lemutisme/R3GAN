@@ -454,5 +454,97 @@ class TestQueueParity(unittest.TestCase):
         self.assertEqual(state["version"], 1)
 
 
+class TestDriftStage2Parity(unittest.TestCase):
+    """Verify training.drift_stage2 matches drifting_models.train.stage2 exactly."""
+
+    def test_grouped_drift_step_raw_loss_parity(self) -> None:
+        from training.drift_field import DriftFieldConfig as NewFieldConfig
+        from training.drift_loss import DriftingLossConfig as NewLossConfig
+        from training.drift_stage2 import (
+            GroupedDriftStepConfig as NewStepConfig,
+            grouped_drift_training_step as new_step,
+        )
+        from training.models.dit_like import DiTLikeConfig as NewDiTConfig, DiTLikeGenerator as NewDiTGen
+
+        from drifting_models.train.stage2 import (
+            GroupedDriftStepConfig as RefStepConfig,
+            grouped_drift_training_step as ref_step,
+        )
+        from drifting_models.drift_loss import DriftingLossConfig as RefLossConfig
+        from drifting_models.drift_field import DriftFieldConfig as RefFieldConfig
+        from drifting_models.models.dit_like import DiTLikeConfig as RefDiTConfig, DiTLikeGenerator as RefDiTGen
+
+        # Build identical generators
+        new_dit_cfg = NewDiTConfig(
+            image_size=8, in_channels=4, out_channels=4, patch_size=2,
+            hidden_dim=32, depth=2, num_heads=4, num_classes=10,
+            register_tokens=4, style_vocab_size=4, style_token_count=2,
+            alpha_hidden_dim=16,
+        )
+        ref_dit_cfg = RefDiTConfig(
+            image_size=8, in_channels=4, out_channels=4, patch_size=2,
+            hidden_dim=32, depth=2, num_heads=4, num_classes=10,
+            register_tokens=4, style_vocab_size=4, style_token_count=2,
+            alpha_hidden_dim=16,
+        )
+
+        torch.manual_seed(42)
+        new_gen = NewDiTGen(new_dit_cfg)
+        torch.manual_seed(42)
+        ref_gen = RefDiTGen(ref_dit_cfg)
+
+        # Copy weights from new to ref to ensure exact parity
+        ref_gen.load_state_dict(new_gen.state_dict())
+
+        # Create separate optimizers
+        new_opt = torch.optim.Adam(new_gen.parameters(), lr=1e-4)
+        ref_opt = torch.optim.Adam(ref_gen.parameters(), lr=1e-4)
+
+        # Fixed seed=99 for inputs
+        torch.manual_seed(99)
+        noise = torch.randn(2, 3, 4, 8, 8)
+        labels = torch.tensor([0, 5])
+        alpha = torch.tensor([1.5, 2.5])
+        positives = torch.randn(2, 4, 4, 8, 8)
+        unconditional = torch.randn(2, 2, 4, 8, 8)
+        unc_weights = torch.tensor([1.0, 0.5])
+
+        # Configs
+        new_loss_cfg = NewLossConfig(drift_field=NewFieldConfig(temperature=0.1))
+        ref_loss_cfg = RefLossConfig(drift_field=RefFieldConfig(temperature=0.1))
+
+        new_step_cfg = NewStepConfig(loss_config=new_loss_cfg)
+        ref_step_cfg = RefStepConfig(loss_config=ref_loss_cfg)
+
+        # Call both
+        new_stats = new_step(
+            generator=new_gen,
+            optimizer=new_opt,
+            noise_grouped=noise,
+            class_labels_grouped=labels,
+            alpha_grouped=alpha,
+            positives_grouped=positives,
+            style_indices_grouped=None,
+            unconditional_grouped=unconditional,
+            unconditional_weight_grouped=unc_weights,
+            config=new_step_cfg,
+        )
+        ref_stats = ref_step(
+            generator=ref_gen,
+            optimizer=ref_opt,
+            noise_grouped=noise,
+            class_labels_grouped=labels,
+            alpha_grouped=alpha,
+            positives_grouped=positives,
+            style_indices_grouped=None,
+            unconditional_grouped=unconditional,
+            unconditional_weight_grouped=unc_weights,
+            config=ref_step_cfg,
+        )
+
+        self.assertAlmostEqual(new_stats["loss"], ref_stats["loss"], places=4)
+        self.assertAlmostEqual(new_stats["mean_drift_norm"], ref_stats["mean_drift_norm"], places=4)
+
+
 if __name__ == "__main__":
     unittest.main()
