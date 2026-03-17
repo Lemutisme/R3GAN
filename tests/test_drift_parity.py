@@ -39,6 +39,16 @@ from drifting_models.drift_loss import (
 )
 from drifting_models.drift_field import DriftFieldConfig as RefDriftFieldConfig2
 
+from training.drift_grouped import (
+    infer_grouped_shapes as new_infer_grouped_shapes,
+    compute_grouped_v as new_compute_grouped_v,
+)
+from drifting_models.train.grouped import (
+    infer_grouped_shapes as ref_infer_grouped_shapes,
+    compute_grouped_v as ref_compute_grouped_v,
+)
+from drifting_models.drift_field import DriftFieldConfig as RefDriftFieldConfig3
+
 
 def toy_compute_drift(gen: torch.Tensor, pos: torch.Tensor, temp: float = 0.05) -> torch.Tensor:
     """
@@ -255,6 +265,45 @@ class TestDriftLossParity(unittest.TestCase):
         torch.testing.assert_close(new_drift, ref_drift)
         for key in ref_stats:
             self.assertAlmostEqual(new_stats[key], ref_stats[key], places=6, msg=f"stat '{key}' mismatch")
+
+
+class TestDriftGroupedParity(unittest.TestCase):
+    """Verify training.drift_grouped matches drifting_models.train.grouped exactly."""
+
+    # ------------------------------------------------------------------
+    # infer_grouped_shapes
+    # ------------------------------------------------------------------
+    def test_infer_grouped_shapes_parity(self) -> None:
+        torch.manual_seed(42)
+        x = torch.randn(3, 4, 16)
+        y_pos = torch.randn(3, 5, 16)
+        y_neg = torch.randn(3, 4, 16)
+
+        new_shapes = new_infer_grouped_shapes(x, y_pos, y_neg)
+        ref_shapes = ref_infer_grouped_shapes(x, y_pos, y_neg)
+
+        self.assertEqual(new_shapes.groups, ref_shapes.groups)
+        self.assertEqual(new_shapes.negatives_per_group, ref_shapes.negatives_per_group)
+        self.assertEqual(new_shapes.positives_per_group, ref_shapes.positives_per_group)
+        self.assertEqual(new_shapes.feature_dim, ref_shapes.feature_dim)
+
+    # ------------------------------------------------------------------
+    # compute_grouped_v
+    # ------------------------------------------------------------------
+    def test_compute_grouped_v_parity(self) -> None:
+        torch.manual_seed(42)
+        x = torch.randn(3, 4, 16)
+        y_pos = torch.randn(3, 5, 16)
+        y_neg = torch.randn(3, 4, 16)
+        temp = 0.1
+
+        new_cfg = NewDriftFieldConfig(temperature=temp)
+        ref_cfg = RefDriftFieldConfig3(temperature=temp)
+
+        new_v = new_compute_grouped_v(x, y_pos, y_neg, config=new_cfg)
+        ref_v = ref_compute_grouped_v(x, y_pos, y_neg, config=ref_cfg)
+
+        torch.testing.assert_close(new_v, ref_v)
 
 
 if __name__ == "__main__":
