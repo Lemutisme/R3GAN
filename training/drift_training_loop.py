@@ -26,7 +26,8 @@ from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 
-from training.drift_loss import DriftLossConfig, cfg_alpha_to_unconditional_weight, grouped_drifting_stopgrad_loss
+from training.drift_field import DriftFieldConfig, cfg_alpha_to_unconditional_weight, build_negative_log_weights
+from training.drift_loss import DriftingLossConfig, drifting_stopgrad_loss
 from training.drift_queue import ClassConditionalSampleQueue, QueueConfig, ensure_class_coverage
 from training.training_loop import cosine_decay_with_warmup, remap_optimizer_state_dict, save_image_grid, setup_snapshot_image_grid
 
@@ -71,33 +72,6 @@ def training_loop(
 ):
     # The shared launcher forwards the full config EasyDict to both trainers.
     # Drift training ignores GAN-only keys such as D_kwargs and augment settings.
-    if drift_config is not None and str(getattr(drift_config, 'backbone', 'r3gan_conv')) == 'dit_like':
-        from training import drift_research
-
-        return drift_research.training_loop(
-            run_dir=run_dir,
-            training_set_kwargs=training_set_kwargs,
-            data_loader_kwargs=data_loader_kwargs,
-            G_kwargs=G_kwargs,
-            G_opt_kwargs=G_opt_kwargs,
-            lr_scheduler=lr_scheduler,
-            beta2_scheduler=beta2_scheduler,
-            metrics=metrics,
-            random_seed=random_seed,
-            num_gpus=num_gpus,
-            rank=rank,
-            batch_size=batch_size,
-            total_kimg=total_kimg,
-            kimg_per_tick=kimg_per_tick,
-            image_snapshot_ticks=image_snapshot_ticks,
-            network_snapshot_ticks=network_snapshot_ticks,
-            resume_pkl=resume_pkl,
-            cudnn_benchmark=cudnn_benchmark,
-            abort_fn=abort_fn,
-            progress_fn=progress_fn,
-            drift_config=drift_config,
-            **_unused_kwargs,
-        )
     StartTime = time.time()
     Device = torch.device('cuda', rank)
     np.random.seed(random_seed * num_gpus + rank)
@@ -270,7 +244,8 @@ def training_loop(
         StepStartEvent.record(torch.cuda.current_stream(Device))
         StepEndEvent.record(torch.cuda.current_stream(Device))
 
-    LossConfig = DriftLossConfig(temperature=drift_temperature)
+    _DriftFieldCfg = DriftFieldConfig(temperature=drift_temperature)
+    _DriftLossCfg = DriftingLossConfig(drift_field=_DriftFieldCfg)
     LastAlphaMean = 0.0
     LastDriftNorm = 0.0
 
@@ -334,13 +309,45 @@ def training_loop(
             FakeImages.shape[2],
             FakeImages.shape[3],
         )
-        Loss, DriftStats = grouped_drifting_stopgrad_loss(
-            x_grouped=FakeGrouped,
-            y_pos_grouped=PositivesGrouped,
-            unconditional_grouped=UnconditionalGrouped,
-            unconditional_weight_grouped=AlphaWeights,
-            config=LossConfig,
-        )
+
+        # Per-group drift loss using drifting_stopgrad_loss
+        GroupLosses = []
+        GroupDriftNorms = []
+        GroupDriftPosNorms = []
+        GroupDriftNegNorms = []
+        for g in range(Groups):
+            gen_flat = FakeGrouped[g].reshape(negatives_per_group, -1)
+            pos_flat = PositivesGrouped[g].reshape(positives_per_group, -1)
+            neg_flat = gen_flat.detach()
+            neg_log_w = None
+            if UnconditionalGrouped is not None:
+                unc_flat = UnconditionalGrouped[g].reshape(unconditional_per_group, -1)
+                neg_flat = torch.cat([neg_flat, unc_flat], dim=0)
+                neg_log_w = build_negative_log_weights(
+                    n_generated_negatives=negatives_per_group,
+                    n_unconditional_negatives=unconditional_per_group,
+                    unconditional_weight=float(AlphaWeights[g].item()),
+                    device=Device,
+                    dtype=torch.float32,
+                )
+            loss_g, _, stats_g = drifting_stopgrad_loss(
+                gen_flat, pos_flat, neg_flat,
+                config=_DriftLossCfg,
+                negative_log_weights=neg_log_w,
+                generated_negative_count=negatives_per_group,
+            )
+            GroupLosses.append(loss_g)
+            GroupDriftNorms.append(stats_g['drift_norm'])
+            GroupDriftPosNorms.append(stats_g['drift_pos_norm'])
+            GroupDriftNegNorms.append(stats_g['drift_neg_norm'])
+
+        Loss = torch.stack(GroupLosses).mean()
+        DriftStats = {
+            'loss': float(Loss.item()),
+            'mean_drift_norm': sum(GroupDriftNorms) / len(GroupDriftNorms),
+            'mean_drift_pos_norm': sum(GroupDriftPosNorms) / len(GroupDriftPosNorms),
+            'mean_drift_neg_norm': sum(GroupDriftNegNorms) / len(GroupDriftNegNorms),
+        }
         Loss.backward()
         G.requires_grad_(False)
 
