@@ -453,6 +453,32 @@ def training_loop(
         SnapshotPkl = None
         SnapshotData = None
         if SaveNetworkThisTick:
+            # Build provenance metadata for reproducibility.
+            _provenance = dict(
+                drift_temperature=drift_temperature,
+                alpha_min=alpha_min,
+                alpha_max=alpha_max,
+                negatives_per_group=negatives_per_group,
+                positives_per_group=positives_per_group,
+                unconditional_per_group=unconditional_per_group,
+                queue_capacity_per_class=queue_capacity_per_class,
+                queue_capacity_global=queue_capacity_global,
+            )
+            if drift_config is not None:
+                _provenance['backbone'] = str(getattr(drift_config, 'backbone', 'r3gan_conv'))
+                _provenance['use_feature_loss'] = bool(getattr(drift_config, 'use_feature_loss', False))
+                _provenance['feature_encoder'] = str(getattr(drift_config, 'feature_encoder', 'none'))
+            try:
+                import subprocess
+                _git_out = subprocess.run(
+                    ['git', 'rev-parse', 'HEAD'],
+                    capture_output=True, text=True, cwd=os.path.dirname(__file__),
+                )
+                if _git_out.returncode == 0:
+                    _provenance['git_commit'] = _git_out.stdout.strip()
+            except Exception:
+                pass
+
             SnapshotData = dict(
                 G=G,
                 D=None,
@@ -462,6 +488,7 @@ def training_loop(
                 trainer='drift',
                 queue_state=Queue.state_dict(),
                 G_opt_state=remap_optimizer_state_dict(G_opt.state_dict(), 'cpu'),
+                provenance=_provenance,
             )
             for Key, Value in list(SnapshotData.items()):
                 if isinstance(Value, torch.nn.Module):
