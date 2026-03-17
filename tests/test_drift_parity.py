@@ -306,5 +306,153 @@ class TestDriftGroupedParity(unittest.TestCase):
         torch.testing.assert_close(new_v, ref_v)
 
 
+class TestFeaturesParity(unittest.TestCase):
+    """Verify training.features matches drifting_models.features exactly."""
+
+    # ------------------------------------------------------------------
+    # vectorize_feature_maps
+    # ------------------------------------------------------------------
+    def test_vectorize_feature_maps_parity(self) -> None:
+        from training.features.vectorize import (
+            FeatureVectorizationConfig as NewVecConfig,
+            vectorize_feature_maps as new_vectorize,
+        )
+        from drifting_models.features.vectorize import (
+            FeatureVectorizationConfig as RefVecConfig,
+            vectorize_feature_maps as ref_vectorize,
+        )
+
+        torch.manual_seed(42)
+        fmaps = [torch.randn(2, 16, 8, 8), torch.randn(2, 32, 4, 4)]
+
+        new_cfg = NewVecConfig()
+        ref_cfg = RefVecConfig()
+
+        new_result = new_vectorize(fmaps, config=new_cfg)
+        ref_result = ref_vectorize(fmaps, config=ref_cfg)
+
+        self.assertEqual(set(new_result.keys()), set(ref_result.keys()))
+        for key in ref_result:
+            torch.testing.assert_close(new_result[key], ref_result[key], msg=f"key '{key}' mismatch")
+
+    # ------------------------------------------------------------------
+    # TinyFeatureEncoder shape
+    # ------------------------------------------------------------------
+    def test_tiny_feature_encoder_shape(self) -> None:
+        from training.features.extractors import (
+            TinyFeatureEncoderConfig as NewEncoderConfig,
+            TinyFeatureEncoder as NewEncoder,
+        )
+
+        config = NewEncoderConfig(in_channels=4, base_channels=16, stages=3)
+        encoder = NewEncoder(config)
+        images = torch.randn(2, 4, 16, 16)
+        features = encoder(images)
+        self.assertEqual(len(features), 3)
+
+    # ------------------------------------------------------------------
+    # TinyFeatureEncoder weight parity
+    # ------------------------------------------------------------------
+    def test_tiny_feature_encoder_weight_parity(self) -> None:
+        from training.features.extractors import (
+            TinyFeatureEncoderConfig as NewEncoderConfig,
+            TinyFeatureEncoder as NewEncoder,
+        )
+        from drifting_models.features.extractors import (
+            TinyFeatureEncoderConfig as RefEncoderConfig,
+            TinyFeatureEncoder as RefEncoder,
+        )
+
+        new_cfg = NewEncoderConfig(in_channels=4, base_channels=16, stages=3)
+        ref_cfg = RefEncoderConfig(in_channels=4, base_channels=16, stages=3)
+
+        torch.manual_seed(42)
+        new_encoder = NewEncoder(new_cfg)
+        torch.manual_seed(42)
+        ref_encoder = RefEncoder(ref_cfg)
+
+        # Copy weights from ref to new to ensure exact parity
+        new_encoder.load_state_dict(ref_encoder.state_dict())
+
+        torch.manual_seed(99)
+        images = torch.randn(2, 4, 16, 16)
+
+        new_features = new_encoder(images)
+        ref_features = ref_encoder(images)
+
+        self.assertEqual(len(new_features), len(ref_features))
+        for i, (nf, rf) in enumerate(zip(new_features, ref_features)):
+            torch.testing.assert_close(nf, rf, msg=f"stage {i} mismatch")
+
+
+class TestQueueParity(unittest.TestCase):
+    """Verify training.drift_queue queue contract (push, sample, state_dict, version)."""
+
+    # ------------------------------------------------------------------
+    # test_queue_push_and_sample
+    # ------------------------------------------------------------------
+    def test_queue_push_and_sample(self) -> None:
+        from training.drift_queue import QueueConfig, ClassConditionalSampleQueue
+
+        config = QueueConfig(num_classes=3, per_class_capacity=16, global_capacity=64)
+        queue = ClassConditionalSampleQueue(config)
+
+        # Push 6 images with labels [0, 1, 2, 0, 1, 2]
+        images = torch.randn(6, 3, 4, 4)
+        labels = torch.tensor([0, 1, 2, 0, 1, 2])
+        queue.push(images, labels)
+
+        # Verify counts
+        self.assertEqual(queue.class_count(0), 2)
+        self.assertEqual(queue.class_count(1), 2)
+        self.assertEqual(queue.class_count(2), 2)
+        self.assertEqual(queue.global_count(), 6)
+        self.assertEqual(queue.class_counts(), [2, 2, 2])
+
+        # Sample positives — should not raise
+        class_labels = torch.tensor([0, 1, 2])
+        positives = queue.sample_positive_grouped(class_labels, 2, torch.device("cpu"))
+        self.assertEqual(positives.shape, (3, 2, 3, 4, 4))
+
+    # ------------------------------------------------------------------
+    # test_queue_state_dict_roundtrip
+    # ------------------------------------------------------------------
+    def test_queue_state_dict_roundtrip(self) -> None:
+        from training.drift_queue import QueueConfig, ClassConditionalSampleQueue
+
+        config = QueueConfig(num_classes=3, per_class_capacity=16, global_capacity=64)
+        queue = ClassConditionalSampleQueue(config)
+
+        images = torch.randn(6, 3, 4, 4)
+        labels = torch.tensor([0, 1, 2, 0, 1, 2])
+        queue.push(images, labels)
+
+        state = queue.state_dict()
+
+        # Restore into a fresh queue
+        queue2 = ClassConditionalSampleQueue(config)
+        queue2.load_state_dict(state)
+
+        self.assertEqual(queue2.class_counts(), queue.class_counts())
+        self.assertEqual(queue2.global_count(), queue.global_count())
+
+    # ------------------------------------------------------------------
+    # test_queue_version_field
+    # ------------------------------------------------------------------
+    def test_queue_version_field(self) -> None:
+        from training.drift_queue import QueueConfig, ClassConditionalSampleQueue
+
+        config = QueueConfig(num_classes=3, per_class_capacity=16, global_capacity=64)
+        queue = ClassConditionalSampleQueue(config)
+
+        images = torch.randn(2, 3, 4, 4)
+        labels = torch.tensor([0, 1])
+        queue.push(images, labels)
+
+        state = queue.state_dict()
+        self.assertIn("version", state)
+        self.assertEqual(state["version"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
