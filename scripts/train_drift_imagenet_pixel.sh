@@ -4,7 +4,6 @@
 #
 # Prerequisites:
 #   - ImageNet 32x32 dataset at $DATA_PATH (StyleGAN-format .zip)
-#     Default: datasets/imagenet32.zip
 #
 # Usage:
 #   bash scripts/train_drift_imagenet_pixel.sh
@@ -12,7 +11,7 @@
 set -euo pipefail
 
 # --- Tunable hyperparameters ---
-DATA_PATH="${DATA_PATH:-datasets/imagenet32.zip}"
+DATA_PATH="${DATA_PATH:-/workspace/datasets/imagenet32.zip}"
 OUTDIR="${OUTDIR:-outputs/drift/imagenet_pixel}"
 GPUS="${GPUS:-1}"
 BATCH="${BATCH:-64}"
@@ -40,7 +39,6 @@ QUEUE_PER_CLASS=64
 QUEUE_GLOBAL=8192
 QUEUE_PUSH=128
 QUEUE_WARMUP=8
-QUEUE_PRIME=4000
 
 # Optimizer
 LR=2e-4

@@ -3,17 +3,17 @@
 # Based on drift_models/configs/pixel/cifar10_queue_1000kimg.yaml.
 #
 # Prerequisites:
-#   - CIFAR-10 dataset at $DATA_PATH (StyleGAN-format .zip or folder)
-#     Default: datasets/cifar10.zip
+#   - CIFAR-10 dataset at $DATA_PATH (StyleGAN-format .zip)
+#     Default: /workspace/datasets/cifar10.zip
 #
 # Usage:
 #   bash scripts/train_drift_cifar10_pixel.sh
 #   DATA_PATH=/path/to/cifar10.zip bash scripts/train_drift_cifar10_pixel.sh
-#   GPUS=2 bash scripts/train_drift_cifar10_pixel.sh
+#   GPUS=2 BATCH=64 bash scripts/train_drift_cifar10_pixel.sh
 set -euo pipefail
 
 # --- Tunable hyperparameters ---
-DATA_PATH="${DATA_PATH:-datasets/cifar10.zip}"
+DATA_PATH="${DATA_PATH:-/workspace/datasets/cifar10.zip}"
 OUTDIR="${OUTDIR:-outputs/drift/cifar10_pixel}"
 GPUS="${GPUS:-1}"
 BATCH="${BATCH:-32}"
@@ -41,7 +41,6 @@ QUEUE_PER_CLASS=256
 QUEUE_GLOBAL=4000
 QUEUE_PUSH=128
 QUEUE_WARMUP=4
-QUEUE_PRIME=2000
 
 # Optimizer
 LR=1e-4

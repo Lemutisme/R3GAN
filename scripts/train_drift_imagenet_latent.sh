@@ -5,15 +5,13 @@
 # This is the FAITHFUL reproduction target. It uses:
 #   - DiT-B/2 architecture (hidden=768, depth=12, heads=12)
 #   - RMSNorm + QK-norm + 2D axial RoPE
-#   - Feature-space drift loss with MAE encoder
+#   - Feature-space drift loss with MAE encoder (or tiny fallback)
 #   - Power-law alpha sampling
 #   - Cosine LR schedule with warmup
 #
 # Prerequisites:
-#   - Pre-encoded ImageNet SD-VAE latent shards at $SHARD_MANIFEST
-#     Format: directory of .pt shards with a manifest.json index
-#   - MAE encoder checkpoint at $MAE_PATH (optional; falls back to tiny encoder)
-#   - ImageNet dataset at $DATA_PATH for the R3GAN dataset loader
+#   - ImageNet dataset at $DATA_PATH (StyleGAN-format .zip)
+#   - (Optional) MAE encoder checkpoint at $MAE_PATH
 #
 # Usage:
 #   bash scripts/train_drift_imagenet_latent.sh
@@ -21,8 +19,7 @@
 set -euo pipefail
 
 # --- Tunable hyperparameters ---
-DATA_PATH="${DATA_PATH:-datasets/imagenet32.zip}"
-SHARD_MANIFEST="${SHARD_MANIFEST:-outputs/datasets/imagenet1k_train_sdvae_latents_shards/manifest.json}"
+DATA_PATH="${DATA_PATH:-/workspace/datasets/imagenet32.zip}"
 MAE_PATH="${MAE_PATH:-}"
 OUTDIR="${OUTDIR:-outputs/drift/imagenet_latent}"
 GPUS="${GPUS:-1}"
@@ -46,14 +43,12 @@ ALPHA_MAX=4.0
 NEG_PER_GROUP=8
 POS_PER_GROUP=16
 UNC_PER_GROUP=4
-GROUPS=16
 
 # Queue
 QUEUE_PER_CLASS=128
 QUEUE_GLOBAL=16384
 QUEUE_PUSH=256
 QUEUE_WARMUP=8
-QUEUE_PRIME=8192
 
 # Optimizer (paper betas)
 LR=4e-4
@@ -62,6 +57,7 @@ BETA2=0.95
 WARMUP=10000
 
 # Feature encoder selection
+FEATURE_ENCODER_FLAGS=()
 if [ -n "$MAE_PATH" ] && [ -f "$MAE_PATH" ]; then
     FEATURE_ENCODER_FLAGS=(
         --feature-encoder=mae

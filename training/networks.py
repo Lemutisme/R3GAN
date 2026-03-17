@@ -119,10 +119,21 @@ class DiTLikeDriftGenerator(nn.Module):
         self.Model = ReferenceDiTLikeGenerator(config)
         self.noise_channels = int(config.in_channels)
         self.style_vocab_size = int(config.style_vocab_size)
+        # z_dim for compatibility with the training loop's print_module_summary.
+        # For DiT, "z" is image-shaped noise [C, H, W], not a flat vector.
+        self.z_dim = int(config.in_channels * config.image_size * config.image_size)
 
     def forward(self, noise, class_labels, alpha=None, style_indices=None):
+        # Accept both flat [B, z_dim] and spatial [B, C, H, W] noise.
+        if noise.ndim == 2:
+            noise = noise.view(
+                noise.shape[0],
+                self.ModelConfig.in_channels,
+                self.ModelConfig.image_size,
+                self.ModelConfig.image_size,
+            )
         if noise.ndim != 4:
-            raise ValueError(f'noise must be [B, C, H, W], got {tuple(noise.shape)}')
+            raise ValueError(f'noise must be [B, C, H, W] or [B, z_dim], got {tuple(noise.shape)}')
         if alpha is None:
             alpha = torch.full([noise.shape[0]], self.EvalAlpha, device=noise.device, dtype=torch.float32)
         elif not isinstance(alpha, torch.Tensor):

@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
-# Ultra-fast ImageNet drift smoke test — runs on CPU with synthetic data.
+# Ultra-fast ImageNet drift smoke test.
 # Purpose: verify the drift pipeline compiles and runs for ImageNet-scale configs.
-# Expected runtime: ~2 minutes on CPU.
+# Expected runtime: ~2 minutes on GPU, ~10 minutes on CPU.
 #
-# Usage:
-#   bash scripts/train_drift_imagenet_smoke.sh
+# Requires an ImageNet-32 zip. If unavailable, use CIFAR-10 zip as a stand-in
+# (the architecture runs regardless of the actual dataset content):
+#   DATA_PATH=/workspace/datasets/cifar10.zip PRESET=CIFAR10 bash scripts/train_drift_imagenet_smoke.sh
 set -euo pipefail
 
 OUTDIR="${OUTDIR:-outputs/drift_smoke/imagenet}"
+DATA_PATH="${DATA_PATH:-/workspace/datasets/cifar10.zip}"
+PRESET="${PRESET:-CIFAR10}"
 
 python train.py \
     --outdir="$OUTDIR" \
-    --data=datasets/imagenet32.zip \
+    --data="$DATA_PATH" \
     --cond=1 \
-    --preset=ImageNet-32 \
+    --preset="$PRESET" \
     --trainer=drift \
     --drift-backbone=dit_like \
+    --gpus=1 \
     --batch=32 \
-    --kimg=0.05 \
-    --kimg-per-tick=0.01 \
-    --image-snapshot-ticks=999 \
-    --network-snapshot-ticks=999 \
+    --kimg=1 \
+    --tick=1 \
     --snap=999 \
     \
     --hidden-dim=64 \
@@ -42,7 +44,7 @@ python train.py \
     --queue-push-batch=32 \
     --queue-warmup-batches=2 \
     --learning-rate=1e-4 \
-    --metrics=none \
+    --metrics none \
     "$@"
 
 echo "Smoke test complete. Output: $OUTDIR"

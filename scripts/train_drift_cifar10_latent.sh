@@ -5,8 +5,7 @@
 # Prerequisites:
 #   - Pre-encoded CIFAR-10 SD-VAE latents at $LATENT_PATH
 #     These are [N, 4, 32, 32] tensors saved as a .pt file.
-#     To create: encode CIFAR-10 images (upscaled to 256x256) through SD-VAE encoder,
-#     then save the [N, 4, 32, 32] latents.
+#     To create: encode CIFAR-10 images (upscaled to 256x256) through SD-VAE encoder.
 #   - CIFAR-10 dataset at $DATA_PATH for the R3GAN dataset loader
 #
 # Usage:
@@ -14,7 +13,7 @@
 set -euo pipefail
 
 # --- Tunable hyperparameters ---
-DATA_PATH="${DATA_PATH:-datasets/cifar10.zip}"
+DATA_PATH="${DATA_PATH:-/workspace/datasets/cifar10.zip}"
 LATENT_PATH="${LATENT_PATH:-outputs/datasets/cifar10_sdvae_latents.pt}"
 OUTDIR="${OUTDIR:-outputs/drift/cifar10_latent}"
 GPUS="${GPUS:-1}"
@@ -43,7 +42,6 @@ QUEUE_PER_CLASS=128
 QUEUE_GLOBAL=2048
 QUEUE_PUSH=256
 QUEUE_WARMUP=4
-QUEUE_PRIME=512
 
 # Optimizer
 LR=1e-4
