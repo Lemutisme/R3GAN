@@ -13,6 +13,7 @@ import json
 import os
 import pickle
 import time
+from math import sqrt
 
 import numpy as np
 import PIL.Image
@@ -26,7 +27,7 @@ from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 
-from training.drift_field import DriftFieldConfig, cfg_alpha_to_unconditional_weight, build_negative_log_weights
+from training.drift_field import DriftFieldConfig, cfg_alpha_to_unconditional_weight, cfg_alpha_to_unconditional_weight_vectorized, build_negative_log_weights
 from training.drift_loss import DriftingLossConfig, drifting_stopgrad_loss
 from training.drift_queue import ClassConditionalSampleQueue, QueueConfig, ensure_class_coverage
 from training.training_loop import cosine_decay_with_warmup, remap_optimizer_state_dict, save_image_grid, setup_snapshot_image_grid
@@ -68,6 +69,8 @@ def training_loop(
     queue_push_batch        = 128,
     queue_warmup_batches    = 4,
     drift_config            = None,
+    use_bf16                = True,
+    clip_grad_norm          = 2.0,
     **_unused_kwargs,
 ):
     # The shared launcher forwards the full config EasyDict to both trainers.
@@ -80,6 +83,7 @@ def training_loop(
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     conv2d_gradfix.enabled = True
+    UseBf16 = use_bf16 and torch.cuda.is_bf16_supported()
 
     if batch_size % num_gpus != 0:
         raise ValueError('batch_size must be divisible by num_gpus')
@@ -129,7 +133,7 @@ def training_loop(
             num_classes=TrainingSet.label_dim,
             per_class_capacity=queue_capacity_per_class,
             global_capacity=queue_capacity_global,
-            store_device='cpu',
+            store_device=Device,
             strict_without_replacement=False,
         )
     )
@@ -282,17 +286,8 @@ def training_loop(
         PositivesGrouped = Queue.sample_positive_grouped(GroupClassIds, positives_per_group, Device)
         UnconditionalGrouped = Queue.sample_unconditional_grouped(Groups, unconditional_per_group, Device)
         AlphaGrouped = _sample_alpha(Groups, alpha_min, alpha_max, Device)
-        AlphaWeights = torch.tensor(
-            [
-                cfg_alpha_to_unconditional_weight(
-                    alpha=float(Value.item()),
-                    n_generated_negatives=negatives_per_group,
-                    n_unconditional_negatives=unconditional_per_group,
-                )
-                for Value in AlphaGrouped
-            ],
-            device=Device,
-            dtype=torch.float32,
+        AlphaWeights = cfg_alpha_to_unconditional_weight_vectorized(
+            AlphaGrouped, negatives_per_group, unconditional_per_group,
         )
 
         z = torch.randn([LocalBatchSize, G.z_dim], device=Device)
@@ -301,7 +296,10 @@ def training_loop(
 
         G_opt.zero_grad(set_to_none=True)
         G.requires_grad_(True)
-        FakeImages = G(z, c, alpha=AlphaFlat)
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=UseBf16):
+            FakeImages = G(z, c, alpha=AlphaFlat)
+        # Loss computation in float32 for numerical stability
+        FakeImages = FakeImages.float()
         FakeGrouped = FakeImages.reshape(
             Groups,
             negatives_per_group,
@@ -310,44 +308,33 @@ def training_loop(
             FakeImages.shape[3],
         )
 
-        # Per-group drift loss using drifting_stopgrad_loss
-        GroupLosses = []
-        GroupDriftNorms = []
-        GroupDriftPosNorms = []
-        GroupDriftNegNorms = []
-        for g in range(Groups):
-            gen_flat = FakeGrouped[g].reshape(negatives_per_group, -1)
-            pos_flat = PositivesGrouped[g].reshape(positives_per_group, -1)
-            neg_flat = gen_flat.detach()
-            neg_log_w = None
-            if UnconditionalGrouped is not None:
-                unc_flat = UnconditionalGrouped[g].reshape(unconditional_per_group, -1)
-                neg_flat = torch.cat([neg_flat, unc_flat], dim=0)
-                neg_log_w = build_negative_log_weights(
-                    n_generated_negatives=negatives_per_group,
-                    n_unconditional_negatives=unconditional_per_group,
-                    unconditional_weight=float(AlphaWeights[g].item()),
-                    device=Device,
-                    dtype=torch.float32,
-                )
-            loss_g, _, stats_g = drifting_stopgrad_loss(
-                gen_flat, pos_flat, neg_flat,
-                config=_DriftLossCfg,
-                negative_log_weights=neg_log_w,
-                generated_negative_count=negatives_per_group,
-            )
-            GroupLosses.append(loss_g)
-            GroupDriftNorms.append(stats_g['drift_norm'])
-            GroupDriftPosNorms.append(stats_g['drift_pos_norm'])
-            GroupDriftNegNorms.append(stats_g['drift_neg_norm'])
+        # Batched drift loss — all groups computed in one fused kernel
+        PixelDim = FakeImages.shape[1] * FakeImages.shape[2] * FakeImages.shape[3]
+        x_grouped = FakeGrouped.reshape(Groups, negatives_per_group, PixelDim)
+        y_pos_grouped = PositivesGrouped.reshape(Groups, positives_per_group, PixelDim)
 
-        Loss = torch.stack(GroupLosses).mean()
-        DriftStats = {
-            'loss': float(Loss.item()),
-            'mean_drift_norm': sum(GroupDriftNorms) / len(GroupDriftNorms),
-            'mean_drift_pos_norm': sum(GroupDriftPosNorms) / len(GroupDriftPosNorms),
-            'mean_drift_neg_norm': sum(GroupDriftNegNorms) / len(GroupDriftNegNorms),
-        }
+        # Build batched negatives: [G, N_gen + N_unc, D]
+        y_neg_grouped = x_grouped.detach()
+        neg_log_weights_grouped = None
+        if UnconditionalGrouped is not None:
+            unc_grouped = UnconditionalGrouped.reshape(Groups, unconditional_per_group, PixelDim)
+            y_neg_grouped = torch.cat([y_neg_grouped, unc_grouped], dim=1)
+            # Build batched log weights: [G, N_neg]
+            gen_zeros = torch.zeros(Groups, negatives_per_group, device=Device, dtype=torch.float32)
+            # Use finfo.min for zero weights to avoid log(0) = -inf (matches build_negative_log_weights)
+            safe_weights = AlphaWeights.clone()
+            zero_mask = safe_weights == 0.0
+            safe_weights[zero_mask] = 1.0  # placeholder, overwritten below
+            unc_log_w = torch.log(safe_weights).unsqueeze(1).expand(Groups, unconditional_per_group)
+            if zero_mask.any():
+                unc_log_w = unc_log_w.clone()
+                unc_log_w[zero_mask] = torch.finfo(torch.float32).min
+            neg_log_weights_grouped = torch.cat([gen_zeros, unc_log_w], dim=1)
+
+        Loss, DriftStats = _batched_drifting_stopgrad_loss(
+            x_grouped, y_pos_grouped, y_neg_grouped,
+            neg_log_weights_grouped, _DriftLossCfg, negatives_per_group,
+        )
         Loss.backward()
         G.requires_grad_(False)
 
@@ -360,6 +347,8 @@ def training_loop(
             Grads = Flat.split([Param.numel() for Param in Params])
             for Param, Grad in zip(Params, Grads):
                 Param.grad = Grad.reshape(Param.shape)
+        if clip_grad_norm is not None and clip_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=clip_grad_norm)
         G_opt.step()
 
         with torch.autograd.profiler.record_function('Gema'):
@@ -369,14 +358,18 @@ def training_loop(
             for b_ema, b in zip(G_ema.buffers(), G.buffers()):
                 b_ema.copy_(b)
 
-        LastAlphaMean = float(AlphaGrouped.mean().item())
-        LastDriftNorm = float(DriftStats['mean_drift_norm'])
+        LastAlphaMean = AlphaGrouped.mean().detach()
+        LastDriftNorm = DriftStats['mean_drift_norm']
         training_stats.report('Loss/G/loss', Loss.detach())
         training_stats.report('Loss/G/total', Loss.detach())
-        training_stats.report('Loss/drift_norm', torch.as_tensor(DriftStats['mean_drift_norm'], device=Device))
-        training_stats.report('Loss/drift_pos_norm', torch.as_tensor(DriftStats['mean_drift_pos_norm'], device=Device))
-        training_stats.report('Loss/drift_neg_norm', torch.as_tensor(DriftStats['mean_drift_neg_norm'], device=Device))
-        training_stats.report('Progress/alpha_mean', torch.as_tensor(LastAlphaMean, device=Device))
+        training_stats.report('Loss/drift_norm', DriftStats['mean_drift_norm'])
+        training_stats.report('Loss/drift_pos_norm', DriftStats['mean_drift_pos_norm'])
+        training_stats.report('Loss/drift_neg_norm', DriftStats['mean_drift_neg_norm'])
+        if 'feature_scale' in DriftStats:
+            training_stats.report('Loss/feature_scale', DriftStats['feature_scale'])
+        if 'drift_rms_scale' in DriftStats:
+            training_stats.report('Loss/drift_rms_scale', DriftStats['drift_rms_scale'])
+        training_stats.report('Progress/alpha_mean', LastAlphaMean)
         training_stats.report('Progress/alpha_min', AlphaGrouped.min())
         training_stats.report('Progress/alpha_max', AlphaGrouped.max())
         training_stats.report('Progress/queue_global_count', torch.as_tensor(float(Queue.global_count()), device=Device))
@@ -427,8 +420,8 @@ def training_loop(
             Fields += [f"cpumem {psutil.Process(os.getpid()).memory_info().rss / 2**30:<6.2f}"]
             Fields += [f"gpumem {torch.cuda.max_memory_allocated(Device) / 2**30:<6.2f}"]
             Fields += [f"reserved {torch.cuda.max_memory_reserved(Device) / 2**30:<6.2f}"]
-            Fields += [f"alpha {LastAlphaMean:.3f}"]
-            Fields += [f"drift {LastDriftNorm:.4f}"]
+            Fields += [f"alpha {float(LastAlphaMean):.3f}"]
+            Fields += [f"drift {float(LastDriftNorm):.4f}"]
             Fields += [f"queue {Queue.global_count():<6d}"]
             print(' '.join(Fields))
 
@@ -590,8 +583,8 @@ def training_loop(
 
 def _next_queue_batch(training_set_iterator, device, local_queue_push_batch):
     Images, Labels = next(training_set_iterator)
-    Images = Images[:local_queue_push_batch].detach().clone().to(device).to(torch.float32) / 127.5 - 1
-    Labels = Labels[:local_queue_push_batch].detach().clone().to(device)
+    Images = Images[:local_queue_push_batch].to(device, non_blocking=True).to(torch.float32) / 127.5 - 1
+    Labels = Labels[:local_queue_push_batch].to(device, non_blocking=True)
     return Images, _class_ids_from_labels(Labels)
 
 
@@ -615,3 +608,121 @@ def _sample_alpha(groups, alpha_min, alpha_max, device):
     if alpha_max == alpha_min:
         return torch.full([groups], float(alpha_min), device=device, dtype=torch.float32)
     return torch.rand([groups], device=device, dtype=torch.float32) * (alpha_max - alpha_min) + alpha_min
+
+
+def _batched_drifting_stopgrad_loss(
+    x_grouped, y_pos_grouped, y_neg_grouped,
+    neg_log_weights_grouped, config, generated_negative_count,
+    *, scale_temperature_by_sqrt_dim=True, normalize_features=True,
+    normalize_drifts=True, normalization_eps=1e-8,
+):
+    """Vectorized drift loss over all groups simultaneously.
+
+    Args:
+        x_grouped: [G, N_gen, D] generated samples (flattened pixels)
+        y_pos_grouped: [G, N_pos, D] positive samples
+        y_neg_grouped: [G, N_neg, D] negative samples (gen detached + unconditional)
+        neg_log_weights_grouped: [G, N_neg] or None
+        config: DriftingLossConfig
+        generated_negative_count: int, number of generated negatives in y_neg
+        scale_temperature_by_sqrt_dim: scale temperature by sqrt(D) as in reference impl
+        normalize_features: normalize features by mean pairwise distance before drift
+        normalize_drifts: normalize drift vectors by RMS magnitude
+        normalization_eps: epsilon for normalization clamping
+    Returns:
+        loss: scalar tensor (mean over groups)
+        stats: dict with detached tensor stats
+    """
+    fc = config.drift_field
+
+    # --- P0-B: Feature normalization (reference: drift_loss.py _normalize_features) ---
+    # Scale all vectors by the mean pairwise distance so that temperature has
+    # consistent behaviour regardless of raw pixel magnitude / dimensionality.
+    feature_scale = None
+    if normalize_features:
+        # Mean pairwise distance between generated and positives, detached.
+        # Flatten groups for distance computation: [G*N_gen, D] vs [G*N_pos, D]
+        # Per-group is more accurate but expensive; use global mean for simplicity.
+        with torch.no_grad():
+            # Sample distances from x to y_pos across all groups
+            dists_sample = torch.cdist(x_grouped, y_pos_grouped)  # [G, N_gen, N_pos]
+            mean_dist = dists_sample.mean()
+            dim = float(x_grouped.shape[-1])
+            feature_scale = torch.clamp(mean_dist / sqrt(dim), min=normalization_eps)
+        x_grouped = x_grouped / feature_scale
+        y_pos_grouped = y_pos_grouped / feature_scale
+        y_neg_grouped = y_neg_grouped / feature_scale
+
+    # Batched pairwise distances: [G, N_gen, N_pos] and [G, N_gen, N_neg]
+    dist_pos = torch.cdist(x_grouped, y_pos_grouped)
+    dist_neg = torch.cdist(x_grouped, y_neg_grouped)
+
+    # Self-mask: generated negatives are detached copies of x, mask diagonal
+    if fc.mask_self_negatives and generated_negative_count > 0:
+        diag_count = min(x_grouped.shape[1], generated_negative_count, y_neg_grouped.shape[1])
+        if diag_count > 0:
+            diagonal = torch.arange(diag_count, device=x_grouped.device)
+            dist_neg = dist_neg.clone()
+            dist_neg[:, diagonal, diagonal] = dist_neg[:, diagonal, diagonal] + fc.self_mask_value
+
+    # --- P0-A: Temperature sqrt(D) scaling (reference: drift_loss.py:418-419) ---
+    effective_temperature = fc.temperature
+    if scale_temperature_by_sqrt_dim:
+        effective_temperature = fc.temperature * sqrt(float(x_grouped.shape[-1]))
+
+    logit_pos = -(dist_pos / effective_temperature)
+    logit_neg = -(dist_neg / effective_temperature)
+    if neg_log_weights_grouped is not None:
+        logit_neg = logit_neg + neg_log_weights_grouped.unsqueeze(1)  # [G, 1, N_neg]
+
+    logits = torch.cat([logit_pos, logit_neg], dim=2)  # [G, N_gen, N_pos+N_neg]
+    row_affinity = torch.softmax(logits, dim=-1)
+
+    if fc.normalize_over_x:
+        col_affinity = torch.softmax(logits, dim=-2)
+        affinity = torch.sqrt(torch.clamp(row_affinity * col_affinity, min=fc.eps))
+    else:
+        affinity = row_affinity
+
+    n_pos = y_pos_grouped.shape[1]
+    affinity_pos = affinity[:, :, :n_pos]
+    affinity_neg = affinity[:, :, n_pos:]
+
+    weight_pos = affinity_pos * affinity_neg.sum(dim=2, keepdim=True)
+    weight_neg = affinity_neg * affinity_pos.sum(dim=2, keepdim=True)
+
+    drift_pos = weight_pos @ y_pos_grouped  # [G, N_gen, D]
+    drift_neg = weight_neg @ y_neg_grouped  # [G, N_gen, D]
+    drift = (config.attraction_scale * drift_pos) - (config.repulsion_scale * drift_neg)
+
+    # --- P0-C: Drift normalization (reference: drift_loss.py:550-575) ---
+    # Normalize drift by its RMS magnitude so the loss/gradient scale is stable
+    # regardless of how small or large the raw drift vectors are.
+    drift_rms_scale = None
+    if normalize_drifts:
+        with torch.no_grad():
+            dim = float(drift.shape[-1])
+            drift_rms_scale = torch.sqrt(torch.mean(drift.pow(2).sum(dim=-1) / dim))
+            drift_rms_scale = torch.clamp(drift_rms_scale, min=normalization_eps)
+        drift = drift / drift_rms_scale
+
+    target = x_grouped + drift
+    if config.stopgrad_target:
+        target = target.detach()
+    # Per-group MSE, then mean over groups
+    per_group_loss = (x_grouped - target).pow(2).mean(dim=(1, 2))  # [G]
+    loss = per_group_loss.mean()
+
+    # Un-normalize drift norms for logging (report in original scale)
+    raw_drift = drift * drift_rms_scale if drift_rms_scale is not None else drift
+    stats = {
+        'mean_drift_norm': raw_drift.norm(dim=-1).mean().detach(),
+        'mean_drift_pos_norm': drift_pos.norm(dim=-1).mean().detach(),
+        'mean_drift_neg_norm': drift_neg.norm(dim=-1).mean().detach(),
+    }
+    if feature_scale is not None:
+        stats['feature_scale'] = feature_scale.detach()
+    if drift_rms_scale is not None:
+        stats['drift_rms_scale'] = drift_rms_scale.detach()
+    stats['effective_temperature'] = effective_temperature
+    return loss, stats

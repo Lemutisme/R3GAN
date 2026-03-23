@@ -1,50 +1,49 @@
 #!/usr/bin/env bash
-# CIFAR-10 pixel-space drift training with P0 fixes.
-# Based on drift_models/configs/pixel/cifar10_queue_1000kimg.yaml.
+# CIFAR-10 pixel-space drift training with larger DiT model.
+# Based on drift_models/configs/pixel/cifar10_queue_5090_100000kimg.yaml.
+# Designed for multi-GPU RTX 5090 training with higher GPU utilization.
+#
+# Prerequisites:
+#   - CIFAR-10 dataset at $DATA_PATH (StyleGAN-format .zip)
+#     Default: /workspace/datasets/cifar10.zip
 #
 # Usage:
-#   bash scripts/train_drift_cifar10_pixel.sh
-#   CUDA_VISIBLE_DEVICES=3 bash scripts/train_drift_cifar10_pixel.sh
-#   GPUS=2 BATCH=512 bash scripts/train_drift_cifar10_pixel.sh
+#   GPUS=2 BATCH=512 bash scripts/train_drift_cifar10_pixel_large.sh
+#   CUDA_VISIBLE_DEVICES=2,3 GPUS=2 BATCH=512 bash scripts/train_drift_cifar10_pixel_large.sh
 set -euo pipefail
 
 # --- Tunable hyperparameters ---
 DATA_PATH="${DATA_PATH:-/workspace/datasets/cifar10.zip}"
-OUTDIR="${OUTDIR:-outputs/drift/cifar10_pixel}"
-GPUS="${GPUS:-1}"
+OUTDIR="${OUTDIR:-outputs/drift/cifar10_pixel_large}"
+GPUS="${GPUS:-2}"
 BATCH="${BATCH:-512}"
-TOTAL_KIMG="${TOTAL_KIMG:-100000}"
+TOTAL_KIMG="${TOTAL_KIMG:-10000}"
 
-# DiT architecture — scaled to match R3GAN G capacity (~21.6M params)
-HIDDEN_DIM=384
-DEPTH=8
-NUM_HEADS=8
+# DiT architecture (larger, pixel-space — matches 5090 config)
+HIDDEN_DIM=512
+DEPTH=12
+NUM_HEADS=16
 PATCH_SIZE=4
-REGISTER_TOKENS=12
-ALPHA_HIDDEN_DIM=128
+REGISTER_TOKENS=16
 
 # Drift loss
 TEMPERATURE=0.05
 ALPHA_MIN=1.0
 ALPHA_MAX=4.0
 
-# Grouped batch
-NEG_PER_GROUP=4
-POS_PER_GROUP=4
-UNC_PER_GROUP=2
+# Grouped batch (larger groups for higher utilization)
+NEG_PER_GROUP=8
+POS_PER_GROUP=8
+UNC_PER_GROUP=4
 
-# Queue
-QUEUE_PER_CLASS=256
-QUEUE_GLOBAL=4000
-QUEUE_PUSH=128
-QUEUE_WARMUP=4
+# Queue (larger capacities)
+QUEUE_PER_CLASS=2048
+QUEUE_GLOBAL=32768
+QUEUE_PUSH=2048
+QUEUE_WARMUP=16
 
 # Optimizer
 LR=1e-4
-
-# Monitoring
-TICK=50          # print every 50 kimg
-SNAP=5           # snapshot + FID every 5 ticks = 250 kimg
 
 python train.py \
     --outdir="$OUTDIR" \
@@ -57,17 +56,12 @@ python train.py \
     --trainer=drift \
     --drift-backbone=dit_like \
     --kimg="$TOTAL_KIMG" \
-    --tick=$TICK \
-    --snap=$SNAP \
-    --metrics=fid50k_full \
     \
     --hidden-dim=$HIDDEN_DIM \
     --depth=$DEPTH \
     --num-heads=$NUM_HEADS \
     --patch-size=$PATCH_SIZE \
     --register-tokens=$REGISTER_TOKENS \
-    --alpha-hidden-dim=$ALPHA_HIDDEN_DIM \
-    --use-qk-norm \
     \
     --negatives-per-group=$NEG_PER_GROUP \
     --positives-per-group=$POS_PER_GROUP \

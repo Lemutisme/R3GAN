@@ -56,12 +56,13 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = "none"
 
     # Execute training loop.
+    loop_kwargs = {k: v for k, v in c.items() if k != "trainer"}
     if getattr(c, "trainer", "gan") == "drift":
         from training import drift_training_loop
 
-        drift_training_loop.training_loop(rank=rank, **c)
+        drift_training_loop.training_loop(rank=rank, **loop_kwargs)
     else:
-        training_loop.training_loop(rank=rank, **c)
+        training_loop.training_loop(rank=rank, **loop_kwargs)
 
 
 # ----------------------------------------------------------------------------
@@ -693,6 +694,7 @@ def _infer_drift_periodic_eval_paths(*, dataset_name, data_path, inception_weigh
 )
 @click.option("--warmup-steps", help="Warmup steps for warmup_cosine drift scheduler", type=int, default=0, show_default=True)
 @click.option("--clip-grad-norm", help="Gradient clipping norm for drift training", type=float, default=2.0, show_default=True)
+@click.option("--use-bf16/--no-bf16", help="Use bfloat16 autocast for generator forward pass", default=True, show_default=True)
 @click.option("--compile-generator", help="Compile the drift generator forward", is_flag=True)
 @click.option("--compile-backend", help="torch.compile backend for generator", type=str, default="inductor", show_default=True)
 @click.option("--compile-mode", help="torch.compile mode for generator", type=str, default="reduce-overhead", show_default=True)
@@ -948,7 +950,7 @@ def _infer_drift_periodic_eval_paths(*, dataset_name, data_path, inception_weigh
     help="DataLoader worker processes",
     metavar="INT",
     type=click.IntRange(min=1),
-    default=3,
+    default=8,
     show_default=True,
 )
 @click.option("-n", "--dry-run", help="Print training options and exit", is_flag=True)
@@ -1212,6 +1214,7 @@ def main(**kwargs):
     c.trainer = opts.trainer
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
+    c.data_loader_kwargs.persistent_workers = opts.workers > 0
 
     # Sanity checks.
     if c.batch_size % c.num_gpus != 0:
@@ -1429,10 +1432,19 @@ def main(**kwargs):
         c.augment_kwargs = None
         c.aug_scheduler = None
         c.gamma_scheduler = None
-        if opts.drift_backbone == "dit_like" and (opts.scheduler != "none" or float(opts.learning_rate) != 2e-4):
-            c.lr_scheduler = None
-        if opts.drift_backbone == "dit_like" and float(opts.adam_beta2) != 0.0:
-            c.beta2_scheduler = None
+        if opts.drift_backbone == "dit_like":
+            user_lr = float(opts.learning_rate)
+            total_nimg = opts.kimg * 1000
+            if opts.scheduler == "cosine":
+                c.lr_scheduler = dict(base_value=user_lr, final_value=user_lr * 0.25, total_nimg=total_nimg)
+            elif opts.scheduler == "warmup_cosine":
+                c.lr_scheduler = dict(base_value=user_lr, final_value=user_lr * 0.25, total_nimg=total_nimg, warmup_nimg=opts.warmup_steps * c.batch_size)
+            elif user_lr != 2e-4:
+                c.lr_scheduler = None
+            user_beta2 = float(opts.adam_beta2)
+            if user_beta2 != 0.0:
+                c.beta2_scheduler = None
+        c.use_bf16 = opts.use_bf16
         c.negatives_per_group = opts.negatives_per_group
         c.positives_per_group = opts.positives_per_group
         c.unconditional_per_group = opts.unconditional_per_group
@@ -1443,6 +1455,7 @@ def main(**kwargs):
         c.queue_capacity_global = opts.queue_capacity_global
         c.queue_push_batch = opts.queue_push_batch
         c.queue_warmup_batches = opts.queue_warmup_batches
+        c.clip_grad_norm = float(opts.clip_grad_norm)
         c.drift_config = dnnlib.EasyDict(
             backbone=opts.drift_backbone,
             alpha_fixed=opts.alpha_fixed,
@@ -1462,6 +1475,7 @@ def main(**kwargs):
             scheduler=opts.scheduler,
             warmup_steps=int(opts.warmup_steps),
             clip_grad_norm=float(opts.clip_grad_norm),
+            use_bf16=bool(opts.use_bf16),
             compile_generator=bool(opts.compile_generator),
             compile_backend=str(opts.compile_backend),
             compile_mode=str(opts.compile_mode),

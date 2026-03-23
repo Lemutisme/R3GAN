@@ -28,6 +28,19 @@ def cfg_alpha_to_unconditional_weight(
     return ((alpha - 1.0) * (n_generated_negatives - 1)) / n_unconditional_negatives
 
 
+def cfg_alpha_to_unconditional_weight_vectorized(
+    alpha: torch.Tensor,
+    n_generated_negatives: int,
+    n_unconditional_negatives: int,
+) -> torch.Tensor:
+    """Vectorized version: alpha is a 1-D tensor, returns a 1-D tensor of weights."""
+    if n_generated_negatives <= 1:
+        raise ValueError("n_generated_negatives must be > 1")
+    if n_unconditional_negatives <= 0:
+        raise ValueError("n_unconditional_negatives must be > 0")
+    return ((alpha - 1.0) * (n_generated_negatives - 1)) / n_unconditional_negatives
+
+
 def build_negative_log_weights(
     n_generated_negatives: int,
     n_unconditional_negatives: int,

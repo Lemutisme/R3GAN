@@ -44,9 +44,9 @@ def compute_weighted_drift(
     )
     drift = (config.attraction_scale * drift_pos) - (config.repulsion_scale * drift_neg)
     stats = {
-        "drift_norm": float(drift.norm(dim=-1).mean().item()),
-        "drift_pos_norm": float(drift_pos.norm(dim=-1).mean().item()),
-        "drift_neg_norm": float(drift_neg.norm(dim=-1).mean().item()),
+        "drift_norm": drift.norm(dim=-1).mean().detach(),
+        "drift_pos_norm": drift_pos.norm(dim=-1).mean().detach(),
+        "drift_neg_norm": drift_neg.norm(dim=-1).mean().detach(),
         "attraction_scale": float(config.attraction_scale),
         "repulsion_scale": float(config.repulsion_scale),
     }
@@ -74,7 +74,7 @@ def drifting_stopgrad_loss(
     if config.stopgrad_target:
         target = target.detach()
     loss = F.mse_loss(x, target)
-    stats["loss"] = float(loss.item())
+    stats["loss"] = loss.detach()
     return loss, drift, stats
 
 
@@ -97,9 +97,9 @@ def drifting_stopgrad_loss_multi_temperature(
 
     loss_terms: list[torch.Tensor] = []
     stats: dict[str, float] = {}
-    drift_norms: list[float] = []
-    drift_pos_norms: list[float] = []
-    drift_neg_norms: list[float] = []
+    drift_norms: list[torch.Tensor] = []
+    drift_pos_norms: list[torch.Tensor] = []
+    drift_neg_norms: list[torch.Tensor] = []
     for temperature in temperatures:
         temp = float(temperature)
         loss_cfg = replace(config, drift_field=replace(config.drift_field, temperature=temp))
@@ -112,9 +112,9 @@ def drifting_stopgrad_loss_multi_temperature(
             generated_negative_count=generated_negative_count,
         )
         loss_terms.append(loss)
-        drift_norms.append(float(loss_stats["drift_norm"]))
-        drift_pos_norms.append(float(loss_stats["drift_pos_norm"]))
-        drift_neg_norms.append(float(loss_stats["drift_neg_norm"]))
+        drift_norms.append(loss_stats["drift_norm"])
+        drift_pos_norms.append(loss_stats["drift_pos_norm"])
+        drift_neg_norms.append(loss_stats["drift_neg_norm"])
         stats[f"temp_{temp:g}_drift_norm"] = float(loss_stats["drift_norm"])
         stats[f"temp_{temp:g}_drift_pos_norm"] = float(loss_stats["drift_pos_norm"])
         stats[f"temp_{temp:g}_drift_neg_norm"] = float(loss_stats["drift_neg_norm"])
@@ -123,9 +123,9 @@ def drifting_stopgrad_loss_multi_temperature(
     total_loss = stacked.mean() if normalized_reduction == "mean" else stacked.sum()
     stats["loss"] = float(total_loss.item())
     stats["temperature_count"] = float(len(temperatures))
-    stats["mean_drift_norm"] = float(sum(drift_norms) / max(1, len(drift_norms)))
-    stats["mean_drift_pos_norm"] = float(sum(drift_pos_norms) / max(1, len(drift_pos_norms)))
-    stats["mean_drift_neg_norm"] = float(sum(drift_neg_norms) / max(1, len(drift_neg_norms)))
+    stats["mean_drift_norm"] = float(torch.stack(drift_norms).mean())
+    stats["mean_drift_pos_norm"] = float(torch.stack(drift_pos_norms).mean())
+    stats["mean_drift_neg_norm"] = float(torch.stack(drift_neg_norms).mean())
     return total_loss, stats
 
 

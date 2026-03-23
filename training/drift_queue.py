@@ -47,9 +47,9 @@ class ClassConditionalSampleQueue:
             raise ValueError('labels must be [B] and aligned with images')
 
         StoredImages = images.detach().to(self.config.store_device)
-        StoredLabels = labels.detach().to('cpu').long()
+        LabelList = labels.detach().long().tolist()
         for Index in range(StoredImages.shape[0]):
-            Label = int(StoredLabels[Index].item())
+            Label = LabelList[Index]
             if Label < 0 or Label >= self.config.num_classes:
                 raise ValueError(f'label out of range: {Label}')
             Sample = StoredImages[Index]
@@ -63,9 +63,10 @@ class ClassConditionalSampleQueue:
         if samples_per_group <= 0:
             raise ValueError('samples_per_group must be > 0')
 
+        LabelList = class_ids.tolist()
         Outputs = []
         for GroupIndex in range(class_ids.shape[0]):
-            Label = int(class_ids[GroupIndex].item())
+            Label = LabelList[GroupIndex]
             ClassQueue = self._class_queues[Label]
             if len(ClassQueue) == 0:
                 raise RuntimeError(f'class queue {Label} is empty')
@@ -76,7 +77,8 @@ class ClassConditionalSampleQueue:
                 queue_name=f'class queue {Label}',
             )
             Outputs.append(torch.stack(Sampled, dim=0))
-        return torch.stack(Outputs, dim=0).to(device)
+        Stacked = torch.stack(Outputs, dim=0)
+        return Stacked if Stacked.device == device else Stacked.to(device)
 
     def sample_unconditional_grouped(self, groups, samples_per_group, device):
         if groups <= 0:
@@ -95,7 +97,8 @@ class ClassConditionalSampleQueue:
                 queue_name='global queue',
             )
             Outputs.append(torch.stack(Sampled, dim=0))
-        return torch.stack(Outputs, dim=0).to(device)
+        Stacked = torch.stack(Outputs, dim=0)
+        return Stacked if Stacked.device == device else Stacked.to(device)
 
     def class_count(self, label):
         if label < 0 or label >= self.config.num_classes:
@@ -143,6 +146,8 @@ class ClassConditionalSampleQueue:
             ActualValue = ConfigState.get(Key)
             if Key == 'strict_without_replacement' and ActualValue is None:
                 ActualValue = False
+            if Key == 'store_device':
+                continue  # store_device may differ between save/load (cpu vs cuda)
             if ActualValue != ExpectedValue:
                 raise ValueError(f'queue config mismatch for {Key}: expected {ExpectedValue}, found {ActualValue}')
 
@@ -196,7 +201,7 @@ def ensure_class_coverage(queue, class_ids, refill_fn, required_count=1, max_att
         raise ValueError('required_count must be > 0')
 
     Attempts = 0
-    NeededLabels = {int(Label.item()) for Label in class_ids.detach().to('cpu')}
+    NeededLabels = set(class_ids.detach().tolist())
     while any(queue.class_count(Label) < required_count for Label in NeededLabels):
         if Attempts >= max_attempts:
             raise RuntimeError('could not backfill enough samples to satisfy class coverage')
