@@ -276,3 +276,7 @@ $$
 它之所以能比 BigGAN 和 StyleGAN2-ADA 更好，最可能是因为它在它们原本只有 endpoint supervision 的 objective 上，补进了  **pathwise monotonicity、dense off-manifold supervision、以及更有方向性的 critic field** 。而这三件事，恰恰都是现有 baseline 往往没有显式建模的。([ICLR](https://iclr.cc/virtual/2019/poster/937 "ICLR Poster Large Scale GAN Training for High Fidelity Natural Image Synthesis"))
 
 下一步最值得做的，不是先把它扔掉换成“更纯”的 RankGAN，而是把它升格成一个更干净的理论对象：**把现有 interpolation-rank 重新解释成 path-monotonic auxiliary，然后再和 delta-centric pairwise core 组合。**
+
+Update 2026-04-02:
+
+后续复查把这个方向进一步收紧成了一个更保守的版本：主博弈先继续保留 `pairwise delta + R1/R2`，`local coupling` 先只负责提供 neighborhood / anchor，而不是直接重写主配对几何；新的候选对象被写成了一个 `equilibrium-consistent local path loss (ECLP)`，并明确定位为 `D-side auxiliary`。详见 [2026-04-02-equilibrium-consistent-local-path-loss.md](./2026-04-02-equilibrium-consistent-local-path-loss.md)。

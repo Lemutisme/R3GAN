@@ -459,6 +459,11 @@ class R3GANLoss:
         path_rank_alpha_dist="linear",
         path_rank_margin=1.0,
         path_rank_score_reg=0.0,
+        # SPM (Symmetric Pushforward Matching) parameters
+        spm_enable=False,
+        spm_transforms=("downsample8",),
+        spm_weights=(0.25,),
+        spm_margin=1.0,
         use_r1_penalty=True,
         use_r2_penalty=True,
         use_non_aug_gp=False,
@@ -547,6 +552,12 @@ class R3GANLoss:
             self.path_rank_alpha_dist = rank_alpha_dist
             self.path_rank_margin = float(rank_margin)
             self.path_rank_score_reg = float(rank_score_reg)
+
+        # SPM storage
+        self.spm_enable = bool(spm_enable)
+        self.spm_transforms = tuple(spm_transforms) if spm_transforms else ()
+        self.spm_weights = tuple(float(w) for w in spm_weights) if spm_weights else ()
+        self.spm_margin = float(spm_margin)
 
         if self.list_loss_type != "infonce":
             raise ValueError(f"Unknown list_loss_type: {self.list_loss_type}")
@@ -1380,6 +1391,35 @@ class R3GANLoss:
             pair_term = self.lambda_pair * pair_loss.mean()
             list_term = self.lambda_list * list_loss.mean()
             total_loss = pair_term + list_term
+
+            # SPM: symmetric pushforward matching (G phase)
+            spm_term = torch.zeros([], device=real_img.device)
+            if self.spm_enable and len(self.spm_transforms) > 0:
+                from training.spm import compute_spm_loss
+                spm_loss_g, spm_info = compute_spm_loss(
+                    D=self.D, real_img=real_img.detach(), fake_img=fake_img,
+                    real_c=real_c, preprocessor=self.preprocessor,
+                    transforms=self.spm_transforms, weights=self.spm_weights,
+                    margin=self.spm_margin,
+                )
+                # For G phase: G wants to MINIMIZE D(T_k(real)) - D(T_k(fake))
+                # i.e. make fake look real at all scales
+                # Use generator-side loss: softplus(margin + delta)
+                spm_g = torch.zeros([], device=real_img.device)
+                from training.spm import TRANSFORMS
+                for k, (t_name, w) in enumerate(zip(self.spm_transforms, self.spm_weights)):
+                    T = TRANSFORMS[t_name]
+                    real_t = T(real_img.detach())
+                    fake_t = T(fake_img)
+                    rs = self._as_scores(self.D(self.preprocessor(real_t), real_c))
+                    fs = self._as_scores(self.D(self.preprocessor(fake_t), real_c))
+                    delta = rs - fs
+                    g_loss_k = F.softplus(self.spm_margin + delta).mean()
+                    spm_g = spm_g + w * g_loss_k
+                spm_term = spm_g
+                total_loss = total_loss + spm_term
+                training_stats.report("Loss/G/spm", spm_term)
+
             (gain * total_loss).backward()
 
             self._report_common_stats(
@@ -1393,7 +1433,7 @@ class R3GANLoss:
             )
             training_stats.report("Loss/G/pair_weighted", pair_term)
             training_stats.report("Loss/G/list_weighted", list_term)
-            training_stats.report("Loss/G/loss", pair_term + list_term)
+            training_stats.report("Loss/G/loss", pair_term + list_term + spm_term)
             training_stats.report("Loss/G/adv_weighted", pair_term + list_term)
             training_stats.report("Loss/G/total", total_loss)
             return
@@ -1469,8 +1509,23 @@ class R3GANLoss:
             path_term = self.lambda_path_rank * path_rank_loss
             r1_term = (gamma / 2) * r1_penalty.mean() if self.use_r1_penalty else zero_scalar
             r2_term = (gamma / 2) * r2_penalty.mean() if self.use_r2_penalty else zero_scalar
+            # SPM: symmetric pushforward matching (D phase)
+            spm_d_term = zero_scalar
+            if self.spm_enable and len(self.spm_transforms) > 0:
+                from training.spm import TRANSFORMS
+                for k, (t_name, w) in enumerate(zip(self.spm_transforms, self.spm_weights)):
+                    T = TRANSFORMS[t_name]
+                    real_t = T(real_img.detach())
+                    fake_t = T(fake_img.detach())
+                    rs = self._as_scores(self.D(self.preprocessor(real_t), real_c))
+                    fs = self._as_scores(self.D(self.preprocessor(fake_t), real_c))
+                    delta_k = rs - fs
+                    d_loss_k = F.softplus(self.spm_margin - delta_k).mean()
+                    spm_d_term = spm_d_term + w * d_loss_k
+                training_stats.report("Loss/D/spm", spm_d_term)
+
             base_total = adv_term + r1_term + r2_term
-            total_loss = base_total + local_term + path_term
+            total_loss = base_total + local_term + path_term + spm_d_term
             (gain * total_loss).backward()
 
             self._report_common_stats(

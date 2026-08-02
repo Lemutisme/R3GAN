@@ -28,8 +28,11 @@ from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 
 from training.drift_field import DriftFieldConfig, cfg_alpha_to_unconditional_weight, cfg_alpha_to_unconditional_weight_vectorized, build_negative_log_weights
-from training.drift_loss import DriftingLossConfig, drifting_stopgrad_loss
+from training.drift_loss import DriftingLossConfig, FeatureDriftingConfig, drifting_stopgrad_loss
 from training.drift_queue import ClassConditionalSampleQueue, QueueConfig, ensure_class_coverage
+from training.drift_stage2 import GroupedDriftStepConfig, grouped_drift_training_step
+from training.features.extractors import TinyFeatureEncoder, TinyFeatureEncoderConfig, freeze_module_parameters
+from training.features.vectorize import FeatureVectorizationConfig
 from training.training_loop import cosine_decay_with_warmup, remap_optimizer_state_dict, save_image_grid, setup_snapshot_image_grid
 
 #----------------------------------------------------------------------------
@@ -137,6 +140,60 @@ def training_loop(
             strict_without_replacement=False,
         )
     )
+
+    # --- Feature loss setup ---
+    _use_feature_loss = drift_config is not None and getattr(drift_config, 'use_feature_loss', False)
+    FeatureExtractor = None
+    FeatureStepConfig = None
+    if _use_feature_loss:
+        _feat_enc = str(getattr(drift_config, 'feature_encoder', 'tiny'))
+        if _feat_enc != 'tiny':
+            raise ValueError(f'Only "tiny" feature encoder is supported, got "{_feat_enc}"')
+        _feat_in_ch = TrainingSet.image_shape[0]  # 3 for RGB
+        _feat_base_ch = int(getattr(drift_config, 'feature_base_channels', 16))
+        _feat_stages = int(getattr(drift_config, 'feature_stages', 3))
+        FeatureExtractor = TinyFeatureEncoder(
+            TinyFeatureEncoderConfig(
+                in_channels=_feat_in_ch,
+                base_channels=_feat_base_ch,
+                stages=_feat_stages,
+            )
+        ).to(Device).eval()
+        freeze_module_parameters(FeatureExtractor)
+
+        _feat_temps_raw = getattr(drift_config, 'feature_temperatures', [0.02, 0.05, 0.2])
+        _feat_temps = tuple(float(t) for t in _feat_temps_raw) if _feat_temps_raw else (drift_temperature,)
+        _feat_selected = getattr(drift_config, 'feature_selected_stages', None)
+        if _feat_selected is not None:
+            _feat_selected = tuple(int(s) for s in _feat_selected)
+        _feat_vec_cfg = FeatureVectorizationConfig(
+            include_input_x2_mean=bool(getattr(drift_config, 'include_input_x2_mean', False)),
+            include_patch4_stats=bool(getattr(drift_config, 'include_patch4_stats', True)),
+            selected_stages=_feat_selected,
+        )
+        _feat_cfg = FeatureDriftingConfig(
+            temperatures=_feat_temps,
+            vectorization=_feat_vec_cfg,
+            temperature_aggregation=str(getattr(drift_config, 'feature_temperature_aggregation', 'per_temperature_mse')),
+            loss_term_reduction=str(getattr(drift_config, 'feature_loss_term_reduction', 'sum')),
+            scale_temperature_by_sqrt_channels=not bool(getattr(drift_config, 'disable_feature_temperature_sqrt_scaling', False)),
+            share_location_normalization=not bool(getattr(drift_config, 'disable_shared_location_normalization', False)),
+            include_raw_drift_loss=bool(getattr(drift_config, 'feature_include_raw_drift_loss', False)),
+            raw_drift_loss_weight=float(getattr(drift_config, 'feature_raw_drift_loss_weight', 1.0)),
+        )
+        _drift_field_cfg = DriftFieldConfig(temperature=drift_temperature)
+        _base_loss_cfg = DriftingLossConfig(drift_field=_drift_field_cfg)
+        FeatureStepConfig = GroupedDriftStepConfig(
+            loss_config=_base_loss_cfg,
+            feature_config=_feat_cfg,
+            clip_grad_norm=clip_grad_norm if clip_grad_norm > 0 else None,
+            run_optimizer_step=False,  # We handle optimizer step ourselves
+        )
+        if rank == 0:
+            _feat_params = sum(p.numel() for p in FeatureExtractor.parameters())
+            print(f'Feature encoder: {_feat_enc} ({_feat_params:,} params, frozen)')
+            print(f'Feature temperatures: {_feat_temps}')
+            print(f'Feature stages: {_feat_stages}, base_channels: {_feat_base_ch}')
 
     ResumeData = None
     if resume_pkl is not None:
@@ -296,46 +353,69 @@ def training_loop(
 
         G_opt.zero_grad(set_to_none=True)
         G.requires_grad_(True)
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=UseBf16):
-            FakeImages = G(z, c, alpha=AlphaFlat)
-        # Loss computation in float32 for numerical stability
-        FakeImages = FakeImages.float()
-        FakeGrouped = FakeImages.reshape(
-            Groups,
-            negatives_per_group,
-            FakeImages.shape[1],
-            FakeImages.shape[2],
-            FakeImages.shape[3],
-        )
 
-        # Batched drift loss — all groups computed in one fused kernel
-        PixelDim = FakeImages.shape[1] * FakeImages.shape[2] * FakeImages.shape[3]
-        x_grouped = FakeGrouped.reshape(Groups, negatives_per_group, PixelDim)
-        y_pos_grouped = PositivesGrouped.reshape(Groups, positives_per_group, PixelDim)
+        if _use_feature_loss:
+            # --- Feature-space drift loss via drift_stage2 ---
+            # Reshape noise into grouped 5D: [G, N_gen, C, H, W]
+            NoiseGrouped = z.reshape(Groups, negatives_per_group, *TrainingSet.image_shape)
+            ClassLabelsGrouped = GroupClassIds  # [G] integer class ids
+            StepResult = grouped_drift_training_step(
+                generator=G,
+                optimizer=None,  # we handle optimizer step ourselves (for multi-GPU grad sync)
+                noise_grouped=NoiseGrouped,
+                class_labels_grouped=ClassLabelsGrouped,
+                alpha_grouped=AlphaGrouped,
+                positives_grouped=PositivesGrouped,
+                style_indices_grouped=None,
+                unconditional_grouped=UnconditionalGrouped,
+                unconditional_weight_grouped=AlphaWeights,
+                feature_extractor=FeatureExtractor,
+                feature_input_transform=None,
+                amp_dtype=torch.bfloat16 if UseBf16 else None,
+                config=FeatureStepConfig,
+                backward_when_no_step=True,
+            )
+            Loss = torch.tensor(StepResult['loss'], device=Device)
+            DriftStats = {
+                'mean_drift_norm': StepResult.get('mean_drift_norm', 0.0),
+                'mean_drift_pos_norm': StepResult.get('drift_pos_norm', StepResult.get('mean_drift_pos_norm', 0.0)),
+                'mean_drift_neg_norm': StepResult.get('drift_neg_norm', StepResult.get('mean_drift_neg_norm', 0.0)),
+            }
+        else:
+            # --- Pixel-space drift loss (original path) ---
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=UseBf16):
+                FakeImages = G(z, c, alpha=AlphaFlat)
+            FakeImages = FakeImages.float()
+            FakeGrouped = FakeImages.reshape(
+                Groups, negatives_per_group,
+                FakeImages.shape[1], FakeImages.shape[2], FakeImages.shape[3],
+            )
 
-        # Build batched negatives: [G, N_gen + N_unc, D]
-        y_neg_grouped = x_grouped.detach()
-        neg_log_weights_grouped = None
-        if UnconditionalGrouped is not None:
-            unc_grouped = UnconditionalGrouped.reshape(Groups, unconditional_per_group, PixelDim)
-            y_neg_grouped = torch.cat([y_neg_grouped, unc_grouped], dim=1)
-            # Build batched log weights: [G, N_neg]
-            gen_zeros = torch.zeros(Groups, negatives_per_group, device=Device, dtype=torch.float32)
-            # Use finfo.min for zero weights to avoid log(0) = -inf (matches build_negative_log_weights)
-            safe_weights = AlphaWeights.clone()
-            zero_mask = safe_weights == 0.0
-            safe_weights[zero_mask] = 1.0  # placeholder, overwritten below
-            unc_log_w = torch.log(safe_weights).unsqueeze(1).expand(Groups, unconditional_per_group)
-            if zero_mask.any():
-                unc_log_w = unc_log_w.clone()
-                unc_log_w[zero_mask] = torch.finfo(torch.float32).min
-            neg_log_weights_grouped = torch.cat([gen_zeros, unc_log_w], dim=1)
+            PixelDim = FakeImages.shape[1] * FakeImages.shape[2] * FakeImages.shape[3]
+            x_grouped = FakeGrouped.reshape(Groups, negatives_per_group, PixelDim)
+            y_pos_grouped = PositivesGrouped.reshape(Groups, positives_per_group, PixelDim)
 
-        Loss, DriftStats = _batched_drifting_stopgrad_loss(
-            x_grouped, y_pos_grouped, y_neg_grouped,
-            neg_log_weights_grouped, _DriftLossCfg, negatives_per_group,
-        )
-        Loss.backward()
+            y_neg_grouped = x_grouped.detach()
+            neg_log_weights_grouped = None
+            if UnconditionalGrouped is not None:
+                unc_grouped = UnconditionalGrouped.reshape(Groups, unconditional_per_group, PixelDim)
+                y_neg_grouped = torch.cat([y_neg_grouped, unc_grouped], dim=1)
+                gen_zeros = torch.zeros(Groups, negatives_per_group, device=Device, dtype=torch.float32)
+                safe_weights = AlphaWeights.clone()
+                zero_mask = safe_weights == 0.0
+                safe_weights[zero_mask] = 1.0
+                unc_log_w = torch.log(safe_weights).unsqueeze(1).expand(Groups, unconditional_per_group)
+                if zero_mask.any():
+                    unc_log_w = unc_log_w.clone()
+                    unc_log_w[zero_mask] = torch.finfo(torch.float32).min
+                neg_log_weights_grouped = torch.cat([gen_zeros, unc_log_w], dim=1)
+
+            Loss, DriftStats = _batched_drifting_stopgrad_loss(
+                x_grouped, y_pos_grouped, y_neg_grouped,
+                neg_log_weights_grouped, _DriftLossCfg, negatives_per_group,
+            )
+            Loss.backward()
+
         G.requires_grad_(False)
 
         Params = [Param for Param in G.parameters() if Param.grad is not None]

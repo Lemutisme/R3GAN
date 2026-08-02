@@ -195,3 +195,45 @@ def _coerce_class_labels_to_ids(class_labels, batch_size, device):
             raise ValueError('class_labels batch dimension mismatch')
         return class_labels.argmax(dim=1).long()
     raise ValueError(f'class_labels must be [B] or [B, C], got {tuple(class_labels.shape)}')
+
+
+class DriftDiscriminator(nn.Module):
+    """Discriminator with alpha/rank conditioning (mirrors DriftGenerator)."""
+    def __init__(self, *args, **kw):
+        super(DriftDiscriminator, self).__init__()
+
+        config = copy.deepcopy(kw)
+        del config['FP16Stages']
+        del config['c_dim']
+        del config['img_resolution']
+
+        # Internal condition dim = c_dim + 1 (for rank/alpha)
+        InternalConditionDimension = kw['c_dim'] + 1 if kw['c_dim'] != 0 else 1
+        config['ConditionDimension'] = InternalConditionDimension
+
+        self.Model = R3GAN.Networks.Discriminator(*args, **config)
+        self.c_dim = kw['c_dim']
+
+        for x in kw['FP16Stages']:
+            self.Model.MainLayers[x].DataType = torch.bfloat16
+
+    def forward(self, x, c, alpha=None, return_features=False):
+        if alpha is None:
+            alpha = torch.zeros(x.shape[0], 1, device=x.device, dtype=torch.float32)
+        elif not isinstance(alpha, torch.Tensor):
+            alpha = torch.as_tensor(alpha, device=x.device, dtype=torch.float32)
+        else:
+            alpha = alpha.to(device=x.device, dtype=torch.float32)
+
+        if alpha.ndim == 0:
+            alpha = alpha.expand(x.shape[0])
+        alpha = alpha.reshape(x.shape[0], 1)
+
+        if self.c_dim == 0:
+            Condition = alpha
+        else:
+            if c is None:
+                raise ValueError('Conditional drift discriminator requires label inputs')
+            Condition = torch.cat([c.to(device=x.device, dtype=torch.float32), alpha], dim=1)
+
+        return self.Model(x, Condition, return_features=return_features)

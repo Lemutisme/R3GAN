@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CIFAR-10 pixel-space drift training with P0 fixes.
+# CIFAR-10 drift training with feature-space loss.
 # Based on drift_models/configs/pixel/cifar10_queue_1000kimg.yaml.
 #
 # Usage:

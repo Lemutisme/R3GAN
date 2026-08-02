@@ -1,2 +1,7 @@
 __pycache__
+datasets/
 outputs/
+runs/
+
+.cache/
+.claude/

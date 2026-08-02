@@ -886,6 +886,20 @@ def _infer_drift_periodic_eval_paths(*, dataset_name, data_path, inception_weigh
     default="clamp_0_1",
     show_default=True,
 )
+# SPM (Symmetric Pushforward Matching) settings.
+@click.option("--spm-enable", help="Enable SPM multi-scale matching", type=bool, default=False, show_default=True)
+@click.option("--spm-transforms", help="Comma-separated transform names", type=str, default="downsample8")
+@click.option("--spm-weights", help="Comma-separated weights", type=str, default="0.25")
+@click.option("--spm-margin", help="SPM pairwise margin", type=float, default=1.0)
+# Legacy SRG settings (deprecated).
+@click.option("--srg-enable", help="[DEPRECATED] Enable SRG rank training", type=bool, default=False, show_default=True)
+@click.option("--srg-coarse-res", help="[DEPRECATED]", type=int, default=8)
+@click.option("--srg-rank-prob", help="[DEPRECATED]", type=float, default=0.25)
+@click.option("--srg-rank-weight", help="[DEPRECATED]", type=float, default=0.25)
+@click.option("--srg-prefix-coarse", help="Latent prefix dims at coarse rank", type=int, default=16)
+@click.option("--srg-prefix-clean", help="Latent prefix dims at clean rank", type=int, default=64)
+@click.option("--srg-consistency", help="Consistency loss weight", type=float, default=5.0)
+@click.option("--srg-consistency-prob", help="Prob of consistency term", type=float, default=0.25)
 # Misc settings.
 @click.option(
     "--desc", help="String to include in result dir name", metavar="STR", type=str
@@ -1583,6 +1597,17 @@ def main(**kwargs):
     c.loss_kwargs.use_r1_penalty = not opts.disable_r1
     c.loss_kwargs.use_r2_penalty = not opts.disable_r2
     c.loss_kwargs.use_non_aug_gp = opts.non_aug_gp
+
+    # SPM parameters
+    c.loss_kwargs.spm_enable = opts.spm_enable
+    if opts.spm_enable:
+        c.loss_kwargs.spm_transforms = tuple(opts.spm_transforms.split(','))
+        c.loss_kwargs.spm_weights = tuple(float(x) for x in opts.spm_weights.split(','))
+        c.loss_kwargs.spm_margin = opts.spm_margin
+
+    # SRG parameters (legacy, not passed to loss)
+    # SRG is deprecated — SPM replaces it. No network overrides needed for SPM.
+    # (SPM uses standard G and D, just adds transformed-view auxiliary losses)
 
     using_new_main = any(
         value is not None
